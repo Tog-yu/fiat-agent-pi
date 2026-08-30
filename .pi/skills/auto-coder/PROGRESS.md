@@ -25,11 +25,11 @@
 - [x] P2-11 `audit-hook` + PG 审计表
 - [x] P2-12 三道闸门的集成测试
 
-## 阶段 3：告警与测试环境（验收：能查日志、能建测试账号）  —  0/3
+## 阶段 3：告警与测试环境（验收：能查日志、能建测试账号）  —  3/3
 
-- [ ] P3-13 `fiat_es_search_logs` / `fiat_db_query_*` / `fiat_lark_send`
-- [ ] P3-14 `fiat_test_*` 测试环境工具
-- [ ] P3-15 告警诊断 skill
+- [x] P3-13 `fiat_es_search_logs` / `fiat_db_query_*` / `fiat_lark_send`
+- [x] P3-14 `fiat_test_*` 测试环境工具
+- [x] P3-15 告警诊断 skill
 
 ## 阶段 4：返现与物流 dry-run（验收：生成差异清单与变更计划，不改数据）  —  0/3
 
@@ -52,5 +52,5 @@
 - [ ] P6-26 业务 CLI / Web Console
 - [ ] P6-27 Pi harness 迁移跟进 → 评估 `PostgresSessionRepo`
 
-**总计 13/28**
+**总计 16/28**
 

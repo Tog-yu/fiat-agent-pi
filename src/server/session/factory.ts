@@ -11,7 +11,9 @@
 
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type FiatToolClient, LocalFiatClient } from "../../../src/server/fiat-tools/client.ts";
 import { createAuditHook } from "../../../workspace/pi-extensions/audit-hook/index.ts";
+import { createFiatTools } from "../../../workspace/pi-extensions/fiat-tools/index.ts";
 import {
 	createMcpRag,
 	type McpClientLike,
@@ -40,6 +42,8 @@ export interface SessionFactoryOptions {
 	ragClientFactory?: (cfg: RagMcpConfig) => McpClientLike;
 	/** mcp-rag 状态回调透传（ready / unavailable） */
 	ragOnStatus?: (status: RagStatus, detail: string) => void;
+	/** fiat 业务工具执行 client；缺省 LocalFiatClient（stub） */
+	fiatToolClient?: FiatToolClient;
 	/** 会话 ID（审计用）；缺省自动生成 */
 	sessionId?: string;
 }
@@ -102,12 +106,17 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 		sessionId,
 	});
 
+	const fiatTools = createFiatTools({
+		client: opts.fiatToolClient ?? new LocalFiatClient(),
+		allowedTools,
+	});
+
 	return {
 		policies,
 		allowedTools,
 		policyClient,
 		auditClient,
 		sessionId,
-		extensionFactories: [gate, mcpRag, audit],
+		extensionFactories: [gate, mcpRag, fiatTools, audit],
 	};
 }

@@ -27,7 +27,7 @@ policies:
     allowed_environments: [dev, staging, prod]
     allowed_scopes: [cashback_readonly]
 
-  - tool: es_query                  # ES 只读
+  - tool: es_search_logs            # ES 只读（注册名 fiat_es_search_logs，policyToolName 剥前缀）
     risk_level: L2
     allowed_roles: [oncall, ops]
     allowed_environments: [dev, staging, prod]
@@ -51,7 +51,7 @@ policies:
     allowed_environments: [dev, staging, prod]
     allowed_scopes: [alert_readonly]
 
-  - tool: lark_notify               # Lark 告警通知（非破坏性）
+  - tool: lark_send                 # Lark 告警通知（非破坏性，注册名 fiat_lark_send）
     risk_level: L2
     allowed_roles: [oncall, ops]
     allowed_environments: [dev, staging, prod]

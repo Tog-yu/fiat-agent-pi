@@ -213,9 +213,9 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 
 ### 阶段 3：告警与测试环境（验收：能查日志、能建测试账号）
 
-- [ ] P3-13 `fiat_es_search_logs` / `fiat_db_query_*` / `fiat_lark_send`
-- [ ] P3-14 `fiat_test_*` 测试环境工具
-- [ ] P3-15 告警诊断 skill
+- [x] P3-13 `fiat_es_search_logs` / `fiat_db_query_*` / `fiat_lark_send`
+- [x] P3-14 `fiat_test_*` 测试环境工具
+- [x] P3-15 告警诊断 skill
 
 ### 阶段 4：返现与物流 dry-run（验收：生成差异清单与变更计划，不改数据）
 
