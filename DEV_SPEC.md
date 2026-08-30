@@ -208,8 +208,8 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 
 - [x] P2-9 `permission-gate` + L2 `canExecute`
 - [x] P2-10 `session-factory` 按角色裁剪工具集
-- [ ] P2-11 `audit-hook` + PG 审计表
-- [ ] P2-12 三道闸门的集成测试
+- [x] P2-11 `audit-hook` + PG 审计表
+- [x] P2-12 三道闸门的集成测试
 
 ### 阶段 3：告警与测试环境（验收：能查日志、能建测试账号）
 

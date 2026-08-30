@@ -18,12 +18,12 @@
 - [x] P1-7 降级与错误表实现
 - [x] P1-8 `mcp_rag.*` 三个工具注册 + promptSnippet
 
-## 阶段 2：权限与审计（验收：ops 角色看不到也调不动生产写工具）  —  2/4
+## 阶段 2：权限与审计（验收：ops 角色看不到也调不动生产写工具）  —  4/4
 
 - [x] P2-9 `permission-gate` + L2 `canExecute`
 - [x] P2-10 `session-factory` 按角色裁剪工具集
-- [ ] P2-11 `audit-hook` + PG 审计表
-- [ ] P2-12 三道闸门的集成测试
+- [x] P2-11 `audit-hook` + PG 审计表
+- [x] P2-12 三道闸门的集成测试
 
 ## 阶段 3：告警与测试环境（验收：能查日志、能建测试账号）  —  0/3
 
@@ -52,5 +52,5 @@
 - [ ] P6-26 业务 CLI / Web Console
 - [ ] P6-27 Pi harness 迁移跟进 → 评估 `PostgresSessionRepo`
 
-**总计 11/28**
+**总计 13/28**
 

@@ -1,12 +1,10 @@
 /**
- * P2-9 permission-gate 端到端测试。
+ * P2-11 / P2-12 集成测试：audit-hook（三道闸门之后落审计）+ 三道闸门联动。
  *
- * 复用 mcp-rag 扩展（注册 mcp_rag_* 工具，用 mock MCP client），叠加 permission-gate：
- *   - 角色不在白名单（admin 不在 rag_query 的 allowed_roles）→ tool_call 被 block，工具不执行
- *   - 角色在白名单（viewer）→ 放行，工具正常执行
- *
- * 验证"三道闸门第二道"在真实 Pi 链路里确实能拦住 / 放行动作。第三道权威判定（canExecute）由
- * LocalPolicyClient 进程内直连 tool_policies.yaml 提供，零网络。
+ * 手动组合 permission-gate（②）+ mcp-rag + audit-hook（不走 buildSession 的①，否则 admin 的
+ * 工具会被①直接裁掉、测不到②的 block）。覆盖：
+ *   - viewer（在白名单）：工具放行执行，审计记 allowed
+ *   - admin（不在白名单）：gate ② block，审计记 isError + 拒绝原因
  */
 
 import { existsSync, mkdirSync, rmSync } from "node:fs";
@@ -23,7 +21,9 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { InMemoryAuditClient } from "../src/server/audit/client.ts";
 import { LocalPolicyClient } from "../src/server/policy/client.ts";
+import { createAuditHook } from "../workspace/pi-extensions/audit-hook/index.ts";
 import { createMcpRag, type McpClientLike, type RagStatus } from "../workspace/pi-extensions/mcp-rag/index.ts";
 import { createPermissionGate } from "../workspace/pi-extensions/permission-gate/index.ts";
 
@@ -47,24 +47,12 @@ function mockClient(overrides: Partial<McpClientLike> = {}): McpClientLike {
 	};
 }
 
-function toolResultTexts(session: { messages: unknown[] }): string[] {
-	const messages = session.messages as Array<{
-		role: string;
-		content?: Array<{ type: string; text?: string }>;
-	}>;
-	return messages
-		.filter((m) => m.role === "toolResult")
-		.flatMap((m) => m.content ?? [])
-		.filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
-		.map((c) => c.text);
-}
-
-describe("P2-9 permission-gate 端到端（faux + LocalPolicyClient）", () => {
+describe("P2-11/P2-12 audit-hook + 三道闸门联动", () => {
 	let tempDir: string;
 	let faux: ReturnType<typeof registerFauxProvider>;
 
 	beforeEach(() => {
-		tempDir = join(tmpdir(), `fiat-pg-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDir = join(tmpdir(), `fiat-audit-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 		faux = registerFauxProvider();
 	});
@@ -75,6 +63,7 @@ describe("P2-9 permission-gate 端到端（faux + LocalPolicyClient）", () => {
 	});
 
 	async function setup(role: string) {
+		const audit = new InMemoryAuditClient();
 		const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
 		const client = mockClient({
 			callTool: async (req) => {
@@ -103,11 +92,18 @@ describe("P2-9 permission-gate 端到端（faux + LocalPolicyClient）", () => {
 							user: { id: "u1", role },
 							environment: "dev",
 							sessionId: "sess-test",
+							audit,
 						}),
 						createMcpRag({
 							config: { transport: "stdio" },
 							clientFactory: () => client,
 							onStatus: (s, d) => notify?.(s, d),
+						}),
+						createAuditHook({
+							audit,
+							user: { id: "u1", role },
+							environment: "dev",
+							sessionId: "sess-test",
 						}),
 					],
 					noSkills: true,
@@ -134,48 +130,50 @@ describe("P2-9 permission-gate 端到端（faux + LocalPolicyClient）", () => {
 		});
 		await runtimeHost.session.bindExtensions({});
 		const status = await statusReady;
-		return { runtimeHost, calls, status };
+		return { runtimeHost, calls, audit, status };
 	}
 
-	it("① 角色不在白名单（admin）→ tool_call 被 block，工具不执行", async () => {
+	it("① viewer 在白名单：放行执行，审计记 allowed", async () => {
 		faux.setResponses([
 			fauxAssistantMessage([fauxToolCall("mcp_rag_query_knowledge_hub", { query: "返现规则" })], {
 				stopReason: "toolUse",
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const { runtimeHost, calls, status } = await setup("admin");
+		const { runtimeHost, calls, audit, status } = await setup("viewer");
+		expect(status.status).toBe("ready");
+
+		await runtimeHost.session.prompt("查一下返现规则");
+
+		expect(calls).toHaveLength(1);
+		const entries = audit.entries() ?? [];
+		expect(entries).toHaveLength(1);
+		expect(entries[0]?.tool).toBe("mcp_rag_query_knowledge_hub");
+		expect(entries[0]?.outcome).toBe("allowed");
+		expect(entries[0]?.isError).toBe(false);
+
+		runtimeHost.dispose();
+	});
+
+	it("② admin 不在白名单：gate ② block，审计记 isError + 拒绝原因", async () => {
+		faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("mcp_rag_query_knowledge_hub", { query: "返现规则" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("done"),
+		]);
+		const { runtimeHost, calls, audit, status } = await setup("admin");
 		expect(status.status).toBe("ready");
 
 		await runtimeHost.session.prompt("查一下返现规则");
 
 		// 工具从未执行
 		expect(calls).toEqual([]);
-
-		// 会话里出现 isError 的 toolResult，文本含拒绝原因（回灌给模型）
-		const texts = toolResultTexts(runtimeHost.session);
-		expect(texts.length).toBeGreaterThan(0);
-		expect(texts.join("\n")).toContain("角色 admin 无权");
-
-		runtimeHost.dispose();
-	});
-
-	it("② 角色在白名单（viewer）→ 放行，工具正常执行", async () => {
-		faux.setResponses([
-			fauxAssistantMessage([fauxToolCall("mcp_rag_query_knowledge_hub", { query: "返现规则" })], {
-				stopReason: "toolUse",
-			}),
-			fauxAssistantMessage("done"),
-		]);
-		const { runtimeHost, calls, status } = await setup("viewer");
-		expect(status.status).toBe("ready");
-
-		await runtimeHost.session.prompt("查一下返现规则");
-
-		expect(calls).toEqual([{ name: "query_knowledge_hub", arguments: { query: "返现规则" } }]);
-
-		const texts = toolResultTexts(runtimeHost.session);
-		expect(texts.join("\n")).toContain("RAG 答案：返现规则如下…");
+		const entries = audit.entries() ?? [];
+		expect(entries).toHaveLength(1);
+		expect(entries[0]?.tool).toBe("mcp_rag_query_knowledge_hub");
+		expect(entries[0]?.isError).toBe(true);
+		expect(entries[0]?.detail).toContain("角色 admin 无权");
 
 		runtimeHost.dispose();
 	});

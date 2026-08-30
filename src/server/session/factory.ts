@@ -9,7 +9,9 @@
  * 本模块是组合根：把 L1 扩展（permission-gate / mcp-rag）按 subject 组装成 extensionFactories。
  */
 
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createAuditHook } from "../../../workspace/pi-extensions/audit-hook/index.ts";
 import {
 	createMcpRag,
 	type McpClientLike,
@@ -17,6 +19,7 @@ import {
 	type RagStatus,
 } from "../../../workspace/pi-extensions/mcp-rag/index.ts";
 import { createPermissionGate } from "../../../workspace/pi-extensions/permission-gate/index.ts";
+import { type AuditClient, InMemoryAuditClient } from "../audit/client.ts";
 import { LocalPolicyClient, type PolicyClient } from "../policy/client.ts";
 import { loadPolicies, policyToolName, type ToolPolicy } from "../policy/engine.ts";
 
@@ -29,12 +32,16 @@ export interface SessionFactoryOptions {
 	policiesPath: string;
 	/** 进程内 / HTTP policy client；缺省 LocalPolicyClient（零网络） */
 	policyClient?: PolicyClient;
+	/** 审计 client；缺省 InMemoryAuditClient（测试 / 本地） */
+	auditClient?: AuditClient;
 	/** mcp-rag 配置；缺省 stdio */
 	ragConfig?: RagMcpConfig;
 	/** mcp-rag 客户端工厂（测试 mock / 真实 SDK）；缺省用真实 SDK */
 	ragClientFactory?: (cfg: RagMcpConfig) => McpClientLike;
 	/** mcp-rag 状态回调透传（ready / unavailable） */
 	ragOnStatus?: (status: RagStatus, detail: string) => void;
+	/** 会话 ID（审计用）；缺省自动生成 */
+	sessionId?: string;
 }
 
 export interface SessionFactoryResult {
@@ -42,6 +49,8 @@ export interface SessionFactoryResult {
 	/** 闸门①谓词：registered tool name（如 mcp_rag_query_knowledge_hub）→ 是否允许注册 */
 	allowedTools: (registeredToolName: string) => boolean;
 	policyClient: PolicyClient;
+	auditClient: AuditClient;
+	sessionId: string;
 	extensionFactories: Array<(pi: ExtensionAPI) => void>;
 }
 
@@ -62,12 +71,14 @@ export function allowedToolPredicate(
 	};
 }
 
-/** 组合根：按 subject 装配 permission-gate（②）与 mcp-rag（受①约束） */
+/** 组合根：按 subject 装配 ① session-factory 裁剪 + ② permission-gate + ③ audit-hook */
 export function buildSession(subject: SessionSubject, opts: SessionFactoryOptions): SessionFactoryResult {
 	const policies = loadPolicies(opts.policiesPath);
 	const allowedTools = allowedToolPredicate(policies, subject);
 	const policyClient = opts.policyClient ?? new LocalPolicyClient(opts.policiesPath);
+	const auditClient = opts.auditClient ?? new InMemoryAuditClient();
 	const ragConfig = opts.ragConfig ?? { transport: "stdio" };
+	const sessionId = opts.sessionId ?? randomUUID();
 
 	const mcpRag = createMcpRag({
 		config: ragConfig,
@@ -80,7 +91,23 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 		policy: policyClient,
 		user: subject.user,
 		environment: subject.environment,
+		sessionId,
+		audit: auditClient,
 	});
 
-	return { policies, allowedTools, policyClient, extensionFactories: [gate, mcpRag] };
+	const audit = createAuditHook({
+		audit: auditClient,
+		user: subject.user,
+		environment: subject.environment,
+		sessionId,
+	});
+
+	return {
+		policies,
+		allowedTools,
+		policyClient,
+		auditClient,
+		sessionId,
+		extensionFactories: [gate, mcpRag, audit],
+	};
 }
