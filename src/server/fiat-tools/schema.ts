@@ -55,4 +55,38 @@ export const FIAT_TOOLS: FiatToolDef[] = [
 			payload: Type.Optional(Type.String({ description: "动作参数（JSON 字符串）" })),
 		}),
 	},
+
+	/* 阶段 4：返现与物流 dry-run（只读解析 + 对账，不改数据） */
+	{
+		name: "fiat_cashback_parse",
+		description: "解析返现表格（CSV/TSV）为结构化记录，只读、不写。",
+		parameters: Type.Object({
+			content: Type.String({ description: "表格文本（CSV/TSV）" }),
+			format: Type.Optional(Type.String({ description: "csv | tsv，默认 csv" })),
+		}),
+	},
+	{
+		name: "fiat_cashback_reconcile",
+		description:
+			"返现对账 dry-run：对比表格与系统记录，生成差异清单与变更计划，不改任何数据。仅 dev/staging，ops/oncall，需审批。",
+		parameters: Type.Object({
+			csv: Type.String({ description: "已解析的返现表格文本" }),
+			systemOfRecord: Type.String({ description: "系统记录文本（CSV/TSV），与 csv 同构" }),
+		}),
+	},
+	{
+		name: "fiat_logistics_parse",
+		description: "解析物流表格（CSV/TSV）为结构化记录，只读、不写。",
+		parameters: Type.Object({
+			content: Type.String({ description: "表格文本（CSV/TSV）" }),
+			format: Type.Optional(Type.String({ description: "csv | tsv，默认 csv" })),
+		}),
+	},
+	{
+		name: "fiat_logistics_validate",
+		description: "物流表格校验（只读）：检查必填字段/状态合法性，输出问题清单，不改数据。",
+		parameters: Type.Object({
+			csv: Type.String({ description: "物流表格文本（CSV/TSV）" }),
+		}),
+	},
 ];

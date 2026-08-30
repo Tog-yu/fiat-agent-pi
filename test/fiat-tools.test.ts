@@ -161,4 +161,45 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 
 		runtimeHost.dispose();
 	});
+
+	it("viewer 调 fiat_cashback_parse（L1）：放行，client 收到表格内容", async () => {
+		faux.setResponses([
+			fauxAssistantMessage(
+				[fauxToolCall("fiat_cashback_parse", { content: "order_id,user_id,amount,currency\no1,u1,1,USD" })],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("done"),
+		]);
+		const { runtimeHost, calls, audit } = await setup("viewer", "dev");
+
+		await runtimeHost.session.prompt("解析这张返现表");
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.tool).toBe("fiat_cashback_parse");
+		const entries = audit.entries() ?? [];
+		expect(entries).toHaveLength(1);
+		expect(entries[0]?.outcome).toBe("allowed");
+
+		runtimeHost.dispose();
+	});
+
+	it("ops 在 staging 调 fiat_cashback_reconcile（L4,需审批）：放行 dry-run，不改数据", async () => {
+		faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("fiat_cashback_reconcile", { csv: "x", systemOfRecord: "y" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("done"),
+		]);
+		const { runtimeHost, calls, audit } = await setup("ops", "staging");
+
+		await runtimeHost.session.prompt("对一下返现账");
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.tool).toBe("fiat_cashback_reconcile");
+		const entries = audit.entries() ?? [];
+		expect(entries).toHaveLength(1);
+		expect(entries[0]?.outcome).toBe("allowed");
+
+		runtimeHost.dispose();
+	});
 });

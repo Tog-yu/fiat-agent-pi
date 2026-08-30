@@ -31,11 +31,11 @@
 - [x] P3-14 `fiat_test_*` 测试环境工具
 - [x] P3-15 告警诊断 skill
 
-## 阶段 4：返现与物流 dry-run（验收：生成差异清单与变更计划，不改数据）  —  0/3
+## 阶段 4：返现与物流 dry-run（验收：生成差异清单与变更计划，不改数据）  —  3/3
 
-- [ ] P4-16 `fiat_cashback_parse` / `fiat_cashback_reconcile`
-- [ ] P4-17 `fiat_logistics_parse` / `fiat_logistics_validate`
-- [ ] P4-18 L2 workflow 状态机 + 规则引擎
+- [x] P4-16 `fiat_cashback_parse` / `fiat_cashback_reconcile`
+- [x] P4-17 `fiat_logistics_parse` / `fiat_logistics_validate`
+- [x] P4-18 L2 workflow 状态机 + 规则引擎
 
 ## 阶段 5：审批与生产写（验收：完整走通 dry-run → 工单 → 审批 → 执行 → 审计）  —  0/4
 
@@ -52,5 +52,5 @@
 - [ ] P6-26 业务 CLI / Web Console
 - [ ] P6-27 Pi harness 迁移跟进 → 评估 `PostgresSessionRepo`
 
-**总计 16/28**
+**总计 19/28**
 

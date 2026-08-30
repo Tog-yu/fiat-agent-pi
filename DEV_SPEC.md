@@ -219,9 +219,9 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 
 ### 阶段 4：返现与物流 dry-run（验收：生成差异清单与变更计划，不改数据）
 
-- [ ] P4-16 `fiat_cashback_parse` / `fiat_cashback_reconcile`
-- [ ] P4-17 `fiat_logistics_parse` / `fiat_logistics_validate`
-- [ ] P4-18 L2 workflow 状态机 + 规则引擎
+- [x] P4-16 `fiat_cashback_parse` / `fiat_cashback_reconcile`
+- [x] P4-17 `fiat_logistics_parse` / `fiat_logistics_validate`
+- [x] P4-18 L2 workflow 状态机 + 规则引擎
 
 ### 阶段 5：审批与生产写（验收：完整走通 dry-run → 工单 → 审批 → 执行 → 审计）
 

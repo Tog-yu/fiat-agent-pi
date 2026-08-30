@@ -63,6 +63,12 @@ policies:
     allowed_environments: [dev, staging, prod]
     allowed_scopes: [logistics_readonly]
 
+  - tool: logistics_parse           # 物流表格解析（只读，注册名 fiat_logistics_parse）
+    risk_level: L1
+    allowed_roles: [oncall, ops, viewer]
+    allowed_environments: [dev, staging, prod]
+    allowed_scopes: [logistics_readonly]
+
   - tool: test_env                  # 测试环境自动化（仅 DEV）
     risk_level: L3
     allowed_roles: [oncall, ops]
