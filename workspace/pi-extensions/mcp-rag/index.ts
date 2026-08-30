@@ -14,6 +14,7 @@ import { type McpCallResult, parseMcpContent, textSummary } from "./content.ts";
 import { mcpSchemaToTypeBox } from "./schema.ts";
 import { createTransport, type RagMcpConfig } from "./transport.ts";
 
+export type { RagMcpConfig } from "./transport.ts";
 export { ragConfigFromEnv } from "./transport.ts";
 
 export type RagStatus = "ready" | "unavailable";
@@ -34,6 +35,8 @@ export interface McpRagDeps {
 	clientFactory?: (cfg: RagMcpConfig) => McpClientLike;
 	/** 状态回调：ready（含注册数量）/ unavailable（含原因） */
 	onStatus?: (status: RagStatus, detail: string) => void;
+	/** 工具白名单谓词（三道闸门之①：会话级裁剪，模型根本看不到被拒工具）。缺省不过滤 */
+	allowedTools?: (registeredToolName: string) => boolean;
 }
 
 function defaultClient(cfg: RagMcpConfig): McpClientLike {
@@ -94,6 +97,11 @@ async function bootstrap(pi: ExtensionAPI, deps: McpRagDeps): Promise<void> {
 
 	for (const t of tools) {
 		const toolName = `mcp_rag_${t.name}`;
+		// 闸门①：会话级工具裁剪。白名单谓词拒绝 → 不注册，模型根本看不到
+		if (deps.allowedTools && !deps.allowedTools(toolName)) {
+			deps.onStatus?.("ready", `工具 ${toolName} 不在角色白名单，跳过注册`);
+			continue;
+		}
 		pi.registerTool(
 			defineTool({
 				name: toolName,

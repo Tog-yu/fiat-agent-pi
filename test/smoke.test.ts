@@ -1,7 +1,7 @@
+import { fileURLToPath } from "node:url";
 import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import { loadSkills } from "@earendil-works/pi-coding-agent/core/skills.ts";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
