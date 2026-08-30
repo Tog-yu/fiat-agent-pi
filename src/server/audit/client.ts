@@ -10,7 +10,14 @@
 
 import type { FiatUser } from "../policy/engine.ts";
 
-export type AuditOutcome = "allowed" | "blocked" | "error";
+export type AuditOutcome =
+	| "allowed"
+	| "blocked"
+	| "error"
+	| "ticket_created"
+	| "ticket_approved"
+	| "ticket_rejected"
+	| "applied";
 
 export interface AuditRecord {
 	ts: string;

@@ -54,6 +54,10 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 				calls.push({ tool, input });
 				return client.execute(tool, input);
 			},
+			async applyTool(tool, input) {
+				calls.push({ tool, input });
+				return client.applyTool(tool, input);
+			},
 		};
 
 		const authStorage = AuthStorage.inMemory();

@@ -68,10 +68,11 @@ export const FIAT_TOOLS: FiatToolDef[] = [
 	{
 		name: "fiat_cashback_reconcile",
 		description:
-			"返现对账 dry-run：对比表格与系统记录，生成差异清单与变更计划，不改任何数据。仅 dev/staging，ops/oncall，需审批。",
+			"返现对账：对比表格与系统记录，生成差异清单与变更计划。mode=dry_run 只读不改；mode=apply 触发 L4 写操作（建审批工单，不重试）。仅 dev/staging，ops/oncall，需审批。",
 		parameters: Type.Object({
 			csv: Type.String({ description: "已解析的返现表格文本" }),
 			systemOfRecord: Type.String({ description: "系统记录文本（CSV/TSV），与 csv 同构" }),
+			mode: Type.Optional(Type.String({ description: "dry_run（默认，只读）| apply（触发审批工单）" })),
 		}),
 	},
 	{

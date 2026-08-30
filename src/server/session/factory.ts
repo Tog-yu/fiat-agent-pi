@@ -6,14 +6,23 @@
  *   - ② tool_call 拦截：模型即使绕过（prompt 注入 / 工具名猜测）也会被拦，回灌 isError 文本
  *   - ③ L2 canExecute：唯一权威，执行前最后一查（审批 / 数据范围覆写）
  *
- * 本模块是组合根：把 L1 扩展（permission-gate / mcp-rag）按 subject 组装成 extensionFactories。
+ * 本模块是组合根：把 L1 扩展（permission-gate / mcp-rag / fiat-tools / job-apply）按 subject
+ * 组装成 extensionFactories，并构造阶段 5 的 ApprovalService（审批工单唯一权威）。
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { LocalLarkClient } from "../../../src/server/approval/lark.ts";
+import {
+	ApprovalService,
+	InMemoryTicketStore,
+	type LarkClientLike,
+	type TicketStore,
+} from "../../../src/server/approval/ticket.ts";
 import { type FiatToolClient, LocalFiatClient } from "../../../src/server/fiat-tools/client.ts";
 import { createAuditHook } from "../../../workspace/pi-extensions/audit-hook/index.ts";
 import { createFiatTools } from "../../../workspace/pi-extensions/fiat-tools/index.ts";
+import { createJobApply } from "../../../workspace/pi-extensions/job-apply/index.ts";
 import {
 	createMcpRag,
 	type McpClientLike,
@@ -44,6 +53,12 @@ export interface SessionFactoryOptions {
 	ragOnStatus?: (status: RagStatus, detail: string) => void;
 	/** fiat 业务工具执行 client；缺省 LocalFiatClient（stub） */
 	fiatToolClient?: FiatToolClient;
+	/** 阶段 5：审批工单存储；缺省 InMemoryTicketStore（测试 / 本地） */
+	ticketStore?: TicketStore;
+	/** 阶段 5：Lark 卡片 client；缺省 LocalLarkClient（stub） */
+	larkClient?: LarkClientLike;
+	/** 阶段 5：一次性 token 有效期（ms）；缺省 30 分钟 */
+	tokenTtlMs?: number;
 	/** 会话 ID（审计用）；缺省自动生成 */
 	sessionId?: string;
 }
@@ -54,6 +69,8 @@ export interface SessionFactoryResult {
 	allowedTools: (registeredToolName: string) => boolean;
 	policyClient: PolicyClient;
 	auditClient: AuditClient;
+	/** 阶段 5：审批服务（供 job-apply 工具与 apply 模式复用） */
+	approval: ApprovalService;
 	sessionId: string;
 	extensionFactories: Array<(pi: ExtensionAPI) => void>;
 }
@@ -75,7 +92,9 @@ export function allowedToolPredicate(
 	};
 }
 
-/** 组合根：按 subject 装配 ① session-factory 裁剪 + ② permission-gate + ③ audit-hook */
+const sha256Default = (s: string): string => createHash("sha256").update(s).digest("hex");
+
+/** 组合根：按 subject 装配 ①~③ 闸门 + 阶段 5 审批工单 + fiat/job-apply 工具 */
 export function buildSession(subject: SessionSubject, opts: SessionFactoryOptions): SessionFactoryResult {
 	const policies = loadPolicies(opts.policiesPath);
 	const allowedTools = allowedToolPredicate(policies, subject);
@@ -83,6 +102,9 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 	const auditClient = opts.auditClient ?? new InMemoryAuditClient();
 	const ragConfig = opts.ragConfig ?? { transport: "stdio" };
 	const sessionId = opts.sessionId ?? randomUUID();
+	const fiatClient = opts.fiatToolClient ?? new LocalFiatClient();
+	const ticketStore = opts.ticketStore ?? new InMemoryTicketStore();
+	const larkClient = opts.larkClient ?? new LocalLarkClient();
 
 	const mcpRag = createMcpRag({
 		config: ragConfig,
@@ -106,17 +128,38 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 		sessionId,
 	});
 
-	const fiatTools = createFiatTools({
-		client: opts.fiatToolClient ?? new LocalFiatClient(),
-		allowedTools,
+	// 阶段 5：审批工单唯一权威。与 fiatTools 共用同一个 fiatClient（apply 时执行底层变更）。
+	const approval = new ApprovalService({
+		store: ticketStore,
+		policy: policyClient,
+		lark: larkClient,
+		fiat: fiatClient,
+		audit: auditClient,
+		now: Date.now,
+		genId: randomUUID,
+		genToken: randomUUID,
+		sha256: sha256Default,
+		tokenTtlMs: opts.tokenTtlMs ?? 30 * 60 * 1000,
+		sessionId,
 	});
+
+	const fiatTools = createFiatTools({
+		client: fiatClient,
+		allowedTools,
+		approval,
+		user: subject.user,
+		environment: subject.environment,
+	});
+
+	const jobApply = createJobApply({ approval, allowedTools });
 
 	return {
 		policies,
 		allowedTools,
 		policyClient,
 		auditClient,
+		approval,
 		sessionId,
-		extensionFactories: [gate, mcpRag, fiatTools, audit],
+		extensionFactories: [gate, mcpRag, fiatTools, jobApply, audit],
 	};
 }

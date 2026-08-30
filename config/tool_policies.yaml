@@ -74,3 +74,10 @@ policies:
     allowed_roles: [oncall, ops]
     allowed_environments: [dev]
     allowed_scopes: [test_env]
+
+  - tool: job_apply                 # 执行已审批工单（fiat_job_apply，policyToolName 剥前缀）
+    risk_level: L4
+    allowed_roles: [ops, oncall]
+    allowed_environments: [dev, staging, prod]
+    approval_required: true
+    allowed_scopes: [job_apply]

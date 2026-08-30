@@ -16,7 +16,10 @@ export interface FiatToolResult {
 }
 
 export interface FiatToolClient {
+	/** 只读 / dry-run 工具执行 */
 	execute(tool: string, input: Record<string, unknown>): Promise<FiatToolResult>;
+	/** 高风险写操作：仅在审批通过后由 ApprovalService.apply 调用（P5-20） */
+	applyTool(tool: string, input: Record<string, unknown>): Promise<FiatToolResult>;
 }
 
 /** 本地 stub：确定性返回，输入原样回显，便于单测断言工具真的被调到、参数没被改。 */
@@ -27,6 +30,17 @@ export class LocalFiatClient implements FiatToolClient {
 				{
 					type: "text",
 					text: JSON.stringify({ tool, ok: true, echo: input, _stub: "LocalFiatClient" }),
+				},
+			],
+		};
+	}
+
+	async applyTool(tool: string, input: Record<string, unknown>): Promise<FiatToolResult> {
+		return {
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify({ tool, applied: true, echo: input, _stub: "LocalFiatClient" }),
 				},
 			],
 		};
@@ -44,7 +58,15 @@ export class HttpFiatClient implements FiatToolClient {
 	}
 
 	async execute(tool: string, input: Record<string, unknown>): Promise<FiatToolResult> {
-		const res = await fetch(`${this.baseUrl.replace(/\/$/, "")}/tools/${tool}`, {
+		return this.#post(`/tools/${tool}`, input);
+	}
+
+	async applyTool(tool: string, input: Record<string, unknown>): Promise<FiatToolResult> {
+		return this.#post(`/tools/${tool}/apply`, input);
+	}
+
+	async #post(path: string, input: Record<string, unknown>): Promise<FiatToolResult> {
+		const res = await fetch(`${this.baseUrl.replace(/\/$/, "")}${path}`, {
 			method: "POST",
 			headers: {
 				"content-type": "application/json",
@@ -54,7 +76,7 @@ export class HttpFiatClient implements FiatToolClient {
 		});
 		const body = (await res.json().catch(() => ({}))) as { content?: FiatContentBlock[]; detail?: string };
 		if (!res.ok) {
-			throw new Error(`L2 ${tool} 返回 ${res.status}: ${body.detail ?? JSON.stringify(body)}`);
+			throw new Error(`L2 ${path} 返回 ${res.status}: ${body.detail ?? JSON.stringify(body)}`);
 		}
 		return {
 			content: body.content ?? [{ type: "text", text: JSON.stringify(body) }],

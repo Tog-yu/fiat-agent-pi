@@ -225,10 +225,10 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 
 ### 阶段 5：审批与生产写（验收：完整走通 dry-run → 工单 → 审批 → 执行 → 审计）
 
-- [ ] P5-19 approval ticket + 一次性 token + 幂等键
-- [ ] P5-20 `fiat_job_apply`
-- [ ] P5-21 Lark 审批卡片
-- [ ] P5-22 审计后台
+- [x] P5-19 approval ticket + 一次性 token + 幂等键
+- [x] P5-20 `fiat_job_apply`
+- [x] P5-21 Lark 审批卡片
+- [x] P5-22 审计后台
 
 ### 阶段 6（之后）
 
