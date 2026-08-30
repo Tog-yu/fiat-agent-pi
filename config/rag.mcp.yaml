@@ -1,0 +1,23 @@
+# RAG MCP server 连接配置（阶段 6 / P6-23）。
+#
+# transport 切换只改这一处：
+#   - stdio（MVP，默认）：本地起 MODULAR-RAG-MCP-SERVER 子进程
+#   - http：连已起好的 streamable-http 服务（先 `python -m src.mcp_server.server --transport http`）
+#
+# fiat-agent-pi 侧 mcp-rag 扩展按 transport 选 StdioClientTransport / StreamableHTTPClientTransport，
+# client.connect/listTools/callTool 与 transport 无关，切换零改业务代码。
+
+mcp_servers:
+  rag:
+    # ---- MVP：stdio ----
+    transport: stdio
+    cwd: ../MODULAR-RAG-MCP-SERVER
+    command: python
+    args: ["-m", "src.mcp_server.server"]
+    timeoutMs: 30000
+
+    # ---- 切 http 只改下面几行（删掉上面 stdio 的 cwd/command/args）----
+    # transport: http
+    # url: http://rag-mcp.internal:8000/mcp
+    # token_env: RAG_MCP_TOKEN
+    # timeoutMs: 30000

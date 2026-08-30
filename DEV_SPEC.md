@@ -232,7 +232,7 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 
 ### 阶段 6（之后）
 
-- [ ] P6-23 RAG server 补 streamable-http 入口 → 配置切 http
+- [x] P6-23 RAG server 补 streamable-http 入口 → 配置切 http
 - [ ] P6-24 `model-router`
 - [ ] P6-25 多 agent 并行告警诊断
 - [ ] P6-26 业务 CLI / Web Console
