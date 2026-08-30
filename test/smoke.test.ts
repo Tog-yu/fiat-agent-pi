@@ -1,9 +1,10 @@
 import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import { loadSkills } from "@earendil-works/pi-coding-agent/core/skills.ts";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const PI_DIR = "/Users/tog/Desktop/project/pi";
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 describe("Pi runtime is reachable from fiat-agent", () => {
 	it("exposes the agent session SDK", () => {
@@ -16,7 +17,7 @@ describe("Pi runtime is reachable from fiat-agent", () => {
 
 	it("discovers the auto-coder skill from the workspace", () => {
 		const { skills, diagnostics } = loadSkills({
-			cwd: PI_DIR,
+			cwd: REPO_ROOT,
 			agentDir: "/Users/tog/.pi/agent",
 			skillPaths: [],
 			includeDefaults: true,

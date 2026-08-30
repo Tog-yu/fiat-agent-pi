@@ -206,7 +206,7 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 
 ### 阶段 2：权限与审计（验收：ops 角色看不到也调不动生产写工具）
 
-- [ ] P2-9 `permission-gate` + L2 `canExecute`
+- [x] P2-9 `permission-gate` + L2 `canExecute`
 - [ ] P2-10 `session-factory` 按角色裁剪工具集
 - [ ] P2-11 `audit-hook` + PG 审计表
 - [ ] P2-12 三道闸门的集成测试
