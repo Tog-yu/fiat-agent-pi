@@ -1,0 +1,28 @@
+node_modules/
+dist/
+build/
+coverage/
+
+# env
+.env
+.env.local
+.env.*.local
+
+# logs
+logs/
+*.log
+npm-debug.log*
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# local caches
+.pytest_cache/
+__pycache__/
+
+# pi runtime state (session JSONL, local agent dir)
+workspace/.pi/settings.local.json
+.hf-sessions/

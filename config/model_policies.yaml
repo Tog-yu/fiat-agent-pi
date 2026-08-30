@@ -1,0 +1,53 @@
+# 模型路由策略 (DEV_SPEC D3)
+#
+# 按任务复杂度 / 任务类型选择模型 provider。密钥只通过环境变量名引用
+# (api_key_env)，绝不内联明文。
+#
+# 路由规则（用户约定）：
+#   - 复杂任务  -> gpt      (My Codex 中转, gpt-5.6-terra)
+#   - 中等任务  -> deepseek (deepseek-v4-flash)
+#   - 简单/小上下文 -> local (omlx 本地 Qwen3.6-35B, Anthropic 兼容)
+#
+# 本地模型 (omlx) 为 Anthropic 兼容接口，且 DEV_SPEC §3.1 规定其仅作
+# 开发/降级实验、不进入 MVP 默认依赖，故默认 enabled: false。simple 层在
+# local 不可用时按 fallback 链降级到 deepseek。
+
+providers:
+  gpt:
+    type: openai
+    base_url: http://111.231.66.52:3000/v1
+    model: gpt-5.6-terra
+    api_key_env: FIAT_MODEL_GPT_KEY
+    enabled: true
+  deepseek:
+    type: openai
+    base_url: https://api.deepseek.com
+    model: deepseek-v4-flash
+    api_key_env: FIAT_MODEL_DEEPSEEK_KEY
+    enabled: true
+  local:
+    type: anthropic
+    base_url: http://127.0.0.1:8000
+    model: Qwen3.6-35B-A3B-mxfp4
+    api_key_env: FIAT_MODEL_LOCAL_KEY
+    enabled: false
+
+# 复杂度 -> provider
+tiers:
+  complex: gpt
+  medium: deepseek
+  simple: local
+
+# 任务类型 -> 复杂度层（未列出则用 default_tier）
+task_tiers:
+  alert_diagnosis: complex
+  table_parse: medium
+  rag_qa: simple
+
+default_tier: medium
+
+# 某一层 provider 不可用时的降级链（按顺序尝试）
+fallback:
+  simple: [medium, complex]
+  medium: [complex]
+  complex: []

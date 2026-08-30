@@ -1,0 +1,28 @@
+{
+	"compilerOptions": {
+		"paths": {
+			"@earendil-works/pi-coding-agent": ["../pi/packages/coding-agent/dist/index.d.ts"],
+			"@earendil-works/pi-coding-agent/*": ["../pi/packages/coding-agent/dist/*"],
+			"@earendil-works/pi-ai": ["../pi/packages/ai/dist/index.d.ts"],
+			"@earendil-works/pi-ai/*": ["../pi/packages/ai/dist/*"],
+			"@earendil-works/pi-agent-core": ["../pi/packages/agent/dist/index.d.ts"],
+			"@earendil-works/pi-agent-core/*": ["../pi/packages/agent/dist/*"],
+			"@earendil-works/pi-tui": ["../pi/packages/tui/dist/index.d.ts"],
+			"@earendil-works/pi-tui/*": ["../pi/packages/tui/dist/*"]
+		},
+		"target": "ES2022",
+		"module": "Node16",
+		"moduleResolution": "Node16",
+		"lib": ["ES2022"],
+		"types": ["node"],
+		"strict": true,
+		"erasableSyntaxOnly": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"resolveJsonModule": true,
+		"allowImportingTsExtensions": true,
+		"rewriteRelativeImportExtensions": true,
+		"noEmit": true
+	},
+	"include": ["src/**/*.ts", "workspace/**/*.ts", "test/**/*.ts", "*.ts"]
+}
