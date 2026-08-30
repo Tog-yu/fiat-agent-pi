@@ -1,0 +1,28 @@
+import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { createAgentSession } from "@earendil-works/pi-coding-agent";
+import { loadSkills } from "@earendil-works/pi-coding-agent/core/skills.ts";
+import { describe, expect, it } from "vitest";
+
+const PI_DIR = "/Users/tog/Desktop/project/pi";
+
+describe("Pi runtime is reachable from fiat-agent", () => {
+	it("exposes the agent session SDK", () => {
+		expect(typeof createAgentSession).toBe("function");
+	});
+
+	it("exposes the faux provider used for offline extension tests", () => {
+		expect(typeof registerFauxProvider).toBe("function");
+	});
+
+	it("discovers the auto-coder skill from the workspace", () => {
+		const { skills, diagnostics } = loadSkills({
+			cwd: PI_DIR,
+			agentDir: "/Users/tog/.pi/agent",
+			skillPaths: [],
+			includeDefaults: true,
+		});
+		const names = skills.map((s) => s.name);
+		expect(names).toContain("auto-coder");
+		expect(diagnostics).toHaveLength(0);
+	});
+});
