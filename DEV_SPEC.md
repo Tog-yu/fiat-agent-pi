@@ -236,7 +236,7 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 - [x] P6-24 `model-router`
 - [x] P6-25 多 agent 并行告警诊断
 - [x] P6-26 业务 CLI（Web Console 按决策不做；离线命令零依赖可跑，diagnose 仅在配置 FIAT_MODEL 时经动态 import 加载 Pi）
-- [ ] P6-27 Pi harness 迁移跟进 → 评估 `PostgresSessionRepo`
+- [x] P6-27 Pi harness 迁移跟进 → 评估 `PostgresSessionRepo`（结论：当前不可注入 coding-agent 会话路径，保持 JSONL 轨迹 + PG 业务/审计混合存储；预留 drop-in 设计与接入 seam，见 `docs/P6-27-postgres-session-repo.md`）
 
 ---
 
