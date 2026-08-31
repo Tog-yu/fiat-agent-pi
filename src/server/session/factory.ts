@@ -11,6 +11,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { LocalLarkClient } from "../../../src/server/approval/lark.ts";
 import {
@@ -29,8 +30,14 @@ import {
 	type RagMcpConfig,
 	type RagStatus,
 } from "../../../workspace/pi-extensions/mcp-rag/index.ts";
+import {
+	createModelRouter,
+	type ModelResolver,
+	type RouteApplied,
+} from "../../../workspace/pi-extensions/model-router/index.ts";
 import { createPermissionGate } from "../../../workspace/pi-extensions/permission-gate/index.ts";
 import { type AuditClient, InMemoryAuditClient } from "../audit/client.ts";
+import { loadModelPolicies, type ModelPolicies } from "../models/router.ts";
 import { LocalPolicyClient, type PolicyClient } from "../policy/client.ts";
 import { loadPolicies, policyToolName, type ToolPolicy } from "../policy/engine.ts";
 
@@ -61,6 +68,15 @@ export interface SessionFactoryOptions {
 	tokenTtlMs?: number;
 	/** 会话 ID（审计用）；缺省自动生成 */
 	sessionId?: string;
+	/** P6-24：模型路由策略路径；缺省 config/model_policies.yaml */
+	modelPoliciesPath?: string;
+	/**
+	 * P6-24：`provider/model` → Model。缺省不切模型（fail-safe，路由结果 reason: "no-route"）。
+	 * 生产用 registryResolver(ModelRegistry.create(authStorage))。
+	 */
+	modelResolver?: ModelResolver;
+	/** P6-24：路由结果回调（审计 / 可观测 / 测试断言） */
+	onModelRoute?: (info: RouteApplied) => void;
 }
 
 export interface SessionFactoryResult {
@@ -72,6 +88,8 @@ export interface SessionFactoryResult {
 	/** 阶段 5：审批服务（供 job-apply 工具与 apply 模式复用） */
 	approval: ApprovalService;
 	sessionId: string;
+	/** P6-24：实际加载的模型路由策略（便于调用方检查 tier / fallback 配置） */
+	modelPolicies: ModelPolicies;
 	extensionFactories: Array<(pi: ExtensionAPI) => void>;
 }
 
@@ -93,6 +111,9 @@ export function allowedToolPredicate(
 }
 
 const sha256Default = (s: string): string => createHash("sha256").update(s).digest("hex");
+
+/** 默认模型路由策略：仓库根 config/model_policies.yaml（按模块位置解析，不依赖 cwd） */
+const DEFAULT_MODEL_POLICIES_PATH = fileURLToPath(new URL("../../../config/model_policies.yaml", import.meta.url));
 
 /** 组合根：按 subject 装配 ①~③ 闸门 + 阶段 5 审批工单 + fiat/job-apply 工具 */
 export function buildSession(subject: SessionSubject, opts: SessionFactoryOptions): SessionFactoryResult {
@@ -153,6 +174,14 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 
 	const jobApply = createJobApply({ approval, allowedTools });
 
+	// P6-24：模型路由。默认不注入 resolver —— 没有 Model 可解析就不切模型（fail-safe）。
+	const modelPolicies = loadModelPolicies(opts.modelPoliciesPath ?? DEFAULT_MODEL_POLICIES_PATH);
+	const modelRouter = createModelRouter({
+		policies: modelPolicies,
+		resolveModel: opts.modelResolver ?? (() => undefined),
+		onRoute: opts.onModelRoute,
+	});
+
 	return {
 		policies,
 		allowedTools,
@@ -160,6 +189,7 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 		auditClient,
 		approval,
 		sessionId,
-		extensionFactories: [gate, mcpRag, fiatTools, jobApply, audit],
+		modelPolicies,
+		extensionFactories: [gate, mcpRag, fiatTools, jobApply, audit, modelRouter],
 	};
 }

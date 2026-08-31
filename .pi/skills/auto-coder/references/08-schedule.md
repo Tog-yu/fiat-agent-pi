@@ -21,34 +21,34 @@
 
 ### 阶段 2：权限与审计（验收：ops 角色看不到也调不动生产写工具）
 
-- [ ] P2-9 `permission-gate` + L2 `canExecute`
-- [ ] P2-10 `session-factory` 按角色裁剪工具集
-- [ ] P2-11 `audit-hook` + PG 审计表
-- [ ] P2-12 三道闸门的集成测试
+- [x] P2-9 `permission-gate` + L2 `canExecute`
+- [x] P2-10 `session-factory` 按角色裁剪工具集
+- [x] P2-11 `audit-hook` + PG 审计表
+- [x] P2-12 三道闸门的集成测试
 
 ### 阶段 3：告警与测试环境（验收：能查日志、能建测试账号）
 
-- [ ] P3-13 `fiat_es_search_logs` / `fiat_db_query_*` / `fiat_lark_send`
-- [ ] P3-14 `fiat_test_*` 测试环境工具
-- [ ] P3-15 告警诊断 skill
+- [x] P3-13 `fiat_es_search_logs` / `fiat_db_query_*` / `fiat_lark_send`
+- [x] P3-14 `fiat_test_*` 测试环境工具
+- [x] P3-15 告警诊断 skill
 
 ### 阶段 4：返现与物流 dry-run（验收：生成差异清单与变更计划，不改数据）
 
-- [ ] P4-16 `fiat_cashback_parse` / `fiat_cashback_reconcile`
-- [ ] P4-17 `fiat_logistics_parse` / `fiat_logistics_validate`
-- [ ] P4-18 L2 workflow 状态机 + 规则引擎
+- [x] P4-16 `fiat_cashback_parse` / `fiat_cashback_reconcile`
+- [x] P4-17 `fiat_logistics_parse` / `fiat_logistics_validate`
+- [x] P4-18 L2 workflow 状态机 + 规则引擎
 
 ### 阶段 5：审批与生产写（验收：完整走通 dry-run → 工单 → 审批 → 执行 → 审计）
 
-- [ ] P5-19 approval ticket + 一次性 token + 幂等键
-- [ ] P5-20 `fiat_job_apply`
-- [ ] P5-21 Lark 审批卡片
-- [ ] P5-22 审计后台
+- [x] P5-19 approval ticket + 一次性 token + 幂等键
+- [x] P5-20 `fiat_job_apply`
+- [x] P5-21 Lark 审批卡片
+- [x] P5-22 审计后台
 
 ### 阶段 6（之后）
 
-- [ ] P6-23 RAG server 补 streamable-http 入口 → 配置切 http
-- [ ] P6-24 `model-router`
+- [x] P6-23 RAG server 补 streamable-http 入口 → 配置切 http
+- [x] P6-24 `model-router`
 - [ ] P6-25 多 agent 并行告警诊断
 - [ ] P6-26 业务 CLI / Web Console
 - [ ] P6-27 Pi harness 迁移跟进 → 评估 `PostgresSessionRepo`
