@@ -54,6 +54,8 @@ export interface TicketStore {
 	get(ticketId: string): Promise<ApprovalTicketRecord | null>;
 	update(t: ApprovalTicketRecord): Promise<void>;
 	findByKey(key: string): Promise<ApprovalTicketRecord | null>;
+	/** 列出全部工单（按创建时间倒序）；CLI / 后台列表用 */
+	list(): Promise<ApprovalTicketRecord[]>;
 }
 
 export class InMemoryTicketStore implements TicketStore {
@@ -76,6 +78,15 @@ export class InMemoryTicketStore implements TicketStore {
 	async findByKey(key: string): Promise<ApprovalTicketRecord | null> {
 		const id = this.#byKey.get(key);
 		return id ? (this.#m.get(id) ?? null) : null;
+	}
+
+	async list(): Promise<ApprovalTicketRecord[]> {
+		return this.entries();
+	}
+
+	/** 仅本地实现提供的列举能力（CLI / 后台列表用）；TicketStore 接口不强制，PG 侧走 SQL 查询 */
+	entries(): ApprovalTicketRecord[] {
+		return [...this.#m.values()].sort((a, b) => b.createdAt - a.createdAt);
 	}
 }
 
@@ -147,6 +158,14 @@ export class PgTicketStore implements TicketStore {
 			[key],
 		)) as Record<string, unknown>[];
 		return rows[0] ? PgTicketStore.fromRow(rows[0]) : null;
+	}
+
+	async list(): Promise<ApprovalTicketRecord[]> {
+		const rows = (await this.query("SELECT * FROM fiat_approval_tickets ORDER BY created_at DESC", [])) as Record<
+			string,
+			unknown
+		>[];
+		return rows.map((r) => PgTicketStore.fromRow(r));
 	}
 }
 
@@ -291,6 +310,11 @@ export class ApprovalService {
 		await this.store.update(t);
 		await this.#audit("ticket_rejected", t, reason);
 		return t;
+	}
+
+	/** 列出全部工单（CLI `fiat tickets` / 后台用）；按创建时间倒序 */
+	async list(): Promise<ApprovalTicketRecord[]> {
+		return this.store.list();
 	}
 
 	/**

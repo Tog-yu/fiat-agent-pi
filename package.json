@@ -12,7 +12,8 @@
 		"check": "biome check . && tsgo --noEmit",
 		"typecheck": "tsgo --noEmit",
 		"lint": "biome check --write .",
-		"test": "vitest --run"
+		"test": "vitest --run",
+		"cli": "node --experimental-strip-types src/server/cli/entry.ts"
 	},
 	"dependencies": {
 		"@earendil-works/pi-agent-core": "file:../pi/packages/agent",

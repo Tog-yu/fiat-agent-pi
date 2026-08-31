@@ -42,7 +42,7 @@ import type { RunOne, TaskOutcome } from "../diagnosis/fanout.ts";
 import type { DiagnosisAngle } from "../diagnosis/plan.ts";
 import { loadModelPolicies, type ModelPolicies } from "../models/router.ts";
 import { LocalPolicyClient, type PolicyClient } from "../policy/client.ts";
-import { loadPolicies, policyToolName, type ToolPolicy } from "../policy/engine.ts";
+import { loadPolicies, type ToolPolicy } from "../policy/engine.ts";
 
 export interface SessionSubject {
 	user: { id: string; role: string };
@@ -110,20 +110,10 @@ export interface SessionFactoryResult {
 
 /**
  * 闸门①纯函数：根据 policies 计算「角色 + 环境」允许的工具名谓词。
- * registered tool name 经 policyToolName 归一（mcp_rag_* → rag_query，fiat_* → 去前缀）。
+ * 定义已抽到 predicate.ts（切断与 factory 组合根的 Pi 依赖链）；此处 import 后 re-export 保持兼容。
  */
-export function allowedToolPredicate(
-	policies: Map<string, ToolPolicy>,
-	subject: SessionSubject,
-): (registeredToolName: string) => boolean {
-	return (registeredToolName: string) => {
-		const policy = policies.get(policyToolName(registeredToolName));
-		if (!policy) return false;
-		return (
-			policy.allowed_roles.includes(subject.user.role) && policy.allowed_environments.includes(subject.environment)
-		);
-	};
-}
+import { allowedToolPredicate } from "./predicate.ts";
+export { allowedToolPredicate };
 
 const sha256Default = (s: string): string => createHash("sha256").update(s).digest("hex");
 

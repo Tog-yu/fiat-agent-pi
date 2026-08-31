@@ -235,7 +235,7 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 - [x] P6-23 RAG server 补 streamable-http 入口 → 配置切 http
 - [x] P6-24 `model-router`
 - [x] P6-25 多 agent 并行告警诊断
-- [ ] P6-26 业务 CLI / Web Console
+- [x] P6-26 业务 CLI（Web Console 按决策不做；离线命令零依赖可跑，diagnose 仅在配置 FIAT_MODEL 时经动态 import 加载 Pi）
 - [ ] P6-27 Pi harness 迁移跟进 → 评估 `PostgresSessionRepo`
 
 ---
