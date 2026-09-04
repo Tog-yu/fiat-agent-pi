@@ -27,6 +27,8 @@ import type {
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
+import type { SanitizeOptions } from "./duties.ts";
+import { buildBootstrapContext, sanitizeMessages } from "./duties.ts";
 import type { HostResources } from "./resources.ts";
 import type { HostSession } from "./session.ts";
 import { type HostTool, registerTools } from "./tools.ts";
@@ -71,6 +73,17 @@ export interface HostLoopOptions {
 	 * 由 `bridgeAgentHooks(runner).afterToolCall` 产出。
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+	/**
+	 * 消息去重·清洗（P8-38）。传入则挂 Agent `transformContext`——每轮 LLM 调用前
+	 * 跑 `sanitizeMessages`（丢弃空消息 / 连续重复去重 / 按选项剥图·剥 thinking）。
+	 * 不改 transcript 本体，只清洗发给 LLM 的视图。
+	 */
+	sanitize?: boolean | SanitizeOptions;
+	/**
+	 * bootstrap context（P8-38）。传入 cwd 等则在构造时生成环境上下文消息，
+	 * 追加在恢复的历史之后、任何用户输入之前；配 session 时一并落盘。
+	 */
+	bootstrap?: { cwd: string; time?: string; extra?: string[] };
 }
 
 /** 取最后一条 assistant 消息的文本作为该轮回复 */
@@ -119,7 +132,14 @@ export class PiHostLoop {
 		// 系统提示词优先级：显式 systemPrompt > resources.systemPrompt > 空。
 		// 恢复历史 transcript：有 session 则取 session.messages()，否则空。
 		const systemPrompt = opts.systemPrompt ?? opts.resources?.systemPrompt ?? "";
-		const initialMessages = opts.session ? opts.session.messages() : [];
+		const recovered = opts.session ? opts.session.messages() : [];
+		// bootstrap context（P8-38）：构造时生成环境上下文，排在恢复历史之后。
+		// 新 session 下它属于「未落盘增量」，首轮 syncDelta 一并落盘；resume 场景已在
+		// session.messages() 里，不会重复注入。
+		const initialMessages = opts.bootstrap ? [...recovered, buildBootstrapContext(opts.bootstrap)] : recovered;
+
+		// 消息清洗（P8-38）：挂官方 transformContext——只清洗 LLM 视图，不动 transcript。
+		const sanitizeOptions = opts.sanitize === true ? {} : (opts.sanitize ?? undefined);
 
 		this.agent = new Agent({
 			streamFn,
@@ -132,6 +152,9 @@ export class PiHostLoop {
 			// L1a 钩子桥接点（P8-37）：由 bridgeAgentHooks(runner) 产出后透传。
 			beforeToolCall: opts.beforeToolCall,
 			afterToolCall: opts.afterToolCall,
+			transformContext: sanitizeOptions
+				? (messages) => Promise.resolve(sanitizeMessages(messages, sanitizeOptions))
+				: undefined,
 		});
 
 		if (opts.tools) registerTools(this.agent, opts.tools);
@@ -146,6 +169,30 @@ export class PiHostLoop {
 			this.hostSession.syncDelta(all.slice(this.hostSession.persistedMessageCount));
 		}
 		return lastAssistantText(all);
+	}
+
+	/**
+	 * provider 错误兜底（P8-38）：跑一轮但**不抛**——provider 流失败（prompt 抛错）或
+	 * assistant 以 `stopReason:"error"` 结束时，返回结构化错误而非炸进程。
+	 * 宿主（L2）据此决定重试 / 降级 / 告警；对齐 pi-embedded 的 provider 错误兜底职责。
+	 */
+	async runTurnSafe(
+		userText: string,
+	): Promise<{ ok: true; reply: string } | { ok: false; reply: string; error: string }> {
+		try {
+			const reply = await this.runTurn(userText);
+			// prompt 未抛 ≠ 成功：faux / 真实 provider 可能返回 stopReason "error"。
+			const last = this.agent.state.messages.at(-1) as
+				| { role?: string; stopReason?: string; errorMessage?: string }
+				| undefined;
+			if (last?.role === "assistant" && last.stopReason === "error") {
+				const error = last.errorMessage || "provider returned error stopReason";
+				return { ok: false, reply, error };
+			}
+			return { ok: true, reply };
+		} catch (error) {
+			return { ok: false, reply: "", error: error instanceof Error ? error.message : String(error) };
+		}
 	}
 
 	/** 当前完整 transcript */
