@@ -408,7 +408,7 @@ DefaultResourceLoader({ extensionFactories: [...] })     直接注入扩展，�
 - [x] P9-45 `model-router` → **L1a** 内建 extension（`before_agent_start` 钩子）
 - [x] P9-46 `job-apply` → **L1b** 工具模块
 - [x] P9-47 `alert-fanout` → **L1b** 工具模块（**注意**：名字像钩子，实测零 `pi.on`、单个 `defineTool`，是纯工具，见 §3）
-- [ ] P9-48 **三道闸门重跑**：① 会话级裁剪 ② 内建 extension 的 `tool_call` 拦截 ③ 服务端 `canExecute`（③ 在 L2，不受影响）
+- [x] P9-48 **三道闸门重跑**：① 会话级裁剪 ② 内建 extension 的 `tool_call` 拦截 ③ 服务端 `canExecute`（③ 在 L2，不受影响）
 - [ ] P9-49 **入口切换**：`pi -e` → 自研 CLI/TUI（由 `pi-host` 驱动）；`workspace/pi-extensions/` 归档保留不删
 
 ### 阶段 10（之后）
