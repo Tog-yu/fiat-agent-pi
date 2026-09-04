@@ -9,6 +9,10 @@
  *   `streamSimple` 的 `apiKey`（Pi 的 `StreamOptions.apiKey`）。
  * - 工具通道（L1b / P8-36）与钩子通道（L1a / P8-37）后续挂载：本模块预留 `tools` 注入点
  *   （写 `agent.state.tools`），最小循环先不挂任何工具。
+ * - 会话基础设施（P8-35）：传入 `session: HostSession` 则构造时恢复历史 transcript
+ *   （`session.messages()`）、每轮 `runTurn` 后把增量 `syncDelta` 落盘；传入 `resources:
+ *   HostResources` 则系统提示词优先取 `resources.systemPrompt`。两者均取自 `pi-coding-agent`
+ *   当库用，不依赖扩展加载器。
  *
  * 运行：`Agent` 是有状态包装；`prompt(text)` 跑完一轮，`state.messages` 取回复。
  */
@@ -16,6 +20,8 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
+import type { HostResources } from "./resources.ts";
+import type { HostSession } from "./session.ts";
 
 /** provider 名 → API key；缺省读 `process.env[${PROVIDER}_API_KEY]` */
 export type ApiKeyResolver = (provider: string) => string | undefined;
@@ -34,6 +40,17 @@ export interface HostLoopOptions {
 	 * 赋值即写 `agent.state.tools`，模型当轮可见。
 	 */
 	tools?: Array<unknown>;
+	/**
+	 * 会话句柄（P8-35）。传入则：构造时用 `session.messages()` 恢复历史 transcript，
+	 * 每轮 `runTurn` 后把新增消息 `syncDelta` 落盘。不传则为纯内存会话。
+	 */
+	session?: HostSession;
+	/**
+	 * 宿主资源（P8-35）。传入则：系统提示词优先取 `resources.systemPrompt`。
+	 * （model 仍由本 options 的 `model` 显式传——解析 `Model<Api>` 需要 ModelRegistry，
+	 * 留待宿主层；`resources.model` getter 为后续预留。）
+	 */
+	resources?: HostResources;
 }
 
 /** 取最后一条 assistant 消息的文本作为该轮回复 */
@@ -65,9 +82,11 @@ function textOf(content: unknown): string {
 export class PiHostLoop {
 	readonly agent: Agent;
 	private readonly resolveKey: ApiKeyResolver;
+	private readonly hostSession?: HostSession;
 
 	constructor(opts: HostLoopOptions) {
 		this.resolveKey = opts.getApiKey ?? ((p) => process.env[`${p.toUpperCase()}_API_KEY`]);
+		this.hostSession = opts.session;
 
 		// streamFn：把当前 model 与透传的 options 交给 streamSimple，并补上 apiKey。
 		// Agent 在每轮调用时把 state.model 作为第一个参数传入，因此这里拿到的就是当前模型。
@@ -77,13 +96,18 @@ export class PiHostLoop {
 			options?: Parameters<typeof streamSimple>[2],
 		) => streamSimple(model, context, { ...options, apiKey: this.resolveKey(model.provider) });
 
+		// 系统提示词优先级：显式 systemPrompt > resources.systemPrompt > 空。
+		// 恢复历史 transcript：有 session 则取 session.messages()，否则空。
+		const systemPrompt = opts.systemPrompt ?? opts.resources?.systemPrompt ?? "";
+		const initialMessages = opts.session ? opts.session.messages() : [];
+
 		this.agent = new Agent({
 			streamFn,
 			sessionId: opts.sessionId,
 			initialState: {
 				model: opts.model,
-				systemPrompt: opts.systemPrompt ?? "",
-				messages: [],
+				systemPrompt,
+				messages: initialMessages,
 			},
 		});
 
@@ -93,7 +117,12 @@ export class PiHostLoop {
 	/** 跑一轮：把 userText 作为 user 消息发起，返回最后一条 assistant 文本 */
 	async runTurn(userText: string): Promise<string> {
 		await this.agent.prompt(userText);
-		return lastAssistantText(this.agent.state.messages);
+		const all = this.agent.state.messages;
+		// 每轮把 agent 新增的消息增量落盘（线性追加语义）。
+		if (this.hostSession) {
+			this.hostSession.syncDelta(all.slice(this.hostSession.persistedMessageCount));
+		}
+		return lastAssistantText(all);
 	}
 
 	/** 当前完整 transcript */
