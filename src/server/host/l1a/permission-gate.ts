@@ -12,9 +12,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { AuditClient } from "../../../src/server/audit/client.ts";
-import type { PolicyClient } from "../../../src/server/policy/client.ts";
-import type { CanExecuteReq, FiatUser } from "../../../src/server/policy/engine.ts";
+import type { AuditClient } from "../../audit/client.ts";
+import type { PolicyClient } from "../../policy/client.ts";
+import type { CanExecuteReq, FiatUser } from "../../policy/engine.ts";
 
 export interface PermissionGateDeps {
 	policy: PolicyClient;

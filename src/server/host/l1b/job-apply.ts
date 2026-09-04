@@ -1,8 +1,10 @@
 /**
- * job-apply —— L1 侧「执行已审批工单」工具（阶段 5 / P5-20）。
+ * job-apply —— L1b「执行已审批工单」工具模块（P9-46，原 workspace/pi-extensions/job-apply）。
+ *
+ * **P9-40 新契约**（工具模块）：去掉 `ExtensionAPI` 依赖，工厂直接返回 `HostTool[]`。
  *
  * 模型在 dry-run 之后拿到 ticket_id + token（来自 fiat_cashback_reconcile mode=apply 的
- * 返回），等 Lark 审批通过后调用本工具。本扩展只做薄封装：把参数转交 ApprovalService.apply，
+ * 返回），等 Lark 审批通过后调用本工具。本模块只做薄封装：把参数转交 ApprovalService.apply，
  * 把结构化结果回给模型。业务失败（pending_approval / invalid_token / denied / expired）也用
  * isError:false 回灌，避免模型重试绕行审批。
  *
@@ -10,8 +12,10 @@
  * 还会再调一次 canExecute（L2 再查一次）—— 双保险。
  */
 
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ApprovalService } from "../../../src/server/approval/ticket.ts";
+import { defineTool } from "@earendil-works/pi-coding-agent";
+import type { ApprovalService } from "../../approval/ticket.ts";
+import type { HostTool } from "../tools.ts";
+import { hostToolFromDefinition } from "../tools.ts";
 
 export interface JobApplyDeps {
 	approval: ApprovalService;
@@ -21,10 +25,10 @@ export interface JobApplyDeps {
 
 export const JOB_APPLY_TOOL = "fiat_job_apply";
 
-export function createJobApply(deps: JobApplyDeps) {
-	return (pi: ExtensionAPI) => {
-		if (deps.allowedTools && !deps.allowedTools(JOB_APPLY_TOOL)) return;
-		pi.registerTool(
+export function createJobApply(deps: JobApplyDeps): HostTool[] {
+	if (deps.allowedTools && !deps.allowedTools(JOB_APPLY_TOOL)) return [];
+	return [
+		hostToolFromDefinition(
 			defineTool({
 				name: JOB_APPLY_TOOL,
 				label: "Fiat Job Apply",
@@ -49,6 +53,6 @@ export function createJobApply(deps: JobApplyDeps) {
 					};
 				},
 			}),
-		);
-	};
+		),
+	];
 }

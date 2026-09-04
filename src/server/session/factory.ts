@@ -21,25 +21,17 @@ import {
 	type TicketStore,
 } from "../../../src/server/approval/ticket.ts";
 import { type FiatToolClient, LocalFiatClient } from "../../../src/server/fiat-tools/client.ts";
-import { createAlertFanout } from "../../../workspace/pi-extensions/alert-fanout/index.ts";
-import { createAuditHook } from "../../../workspace/pi-extensions/audit-hook/index.ts";
-import { createFiatTools } from "../../../workspace/pi-extensions/fiat-tools/index.ts";
-import { createJobApply } from "../../../workspace/pi-extensions/job-apply/index.ts";
-import {
-	createMcpRag,
-	type McpClientLike,
-	type RagMcpConfig,
-	type RagStatus,
-} from "../../../workspace/pi-extensions/mcp-rag/index.ts";
-import {
-	createModelRouter,
-	type ModelResolver,
-	type RouteApplied,
-} from "../../../workspace/pi-extensions/model-router/index.ts";
-import { createPermissionGate } from "../../../workspace/pi-extensions/permission-gate/index.ts";
 import { type AuditClient, InMemoryAuditClient } from "../audit/client.ts";
 import type { RunOne, TaskOutcome } from "../diagnosis/fanout.ts";
 import type { DiagnosisAngle } from "../diagnosis/plan.ts";
+import { defineHostTools, type HostTool } from "../host/contracts.ts";
+import { createAuditHook } from "../host/l1a/audit-hook.ts";
+import { createModelRouter, type ModelResolver, type RouteApplied } from "../host/l1a/model-router.ts";
+import { createPermissionGate } from "../host/l1a/permission-gate.ts";
+import { createAlertFanout } from "../host/l1b/alert-fanout.ts";
+import { createFiatTools } from "../host/l1b/fiat-tools.ts";
+import { createJobApply } from "../host/l1b/job-apply.ts";
+import { createMcpRagTools, type McpClientLike, type RagMcpConfig, type RagStatus } from "../host/l1b/mcp-rag.ts";
 import { loadModelPolicies, type ModelPolicies } from "../models/router.ts";
 import { LocalPolicyClient, type PolicyClient } from "../policy/client.ts";
 import { loadPolicies, type ToolPolicy } from "../policy/engine.ts";
@@ -105,7 +97,10 @@ export interface SessionFactoryResult {
 	sessionId: string;
 	/** P6-24：实际加载的模型路由策略（便于调用方检查 tier / fallback 配置） */
 	modelPolicies: ModelPolicies;
+	/** L1a 钩子通道：编译期注入的内建 extension（permission-gate / audit-hook / model-router） */
 	extensionFactories: Array<(pi: ExtensionAPI) => void>;
+	/** L1b 工具通道：直接注册进内嵌循环的工具模块产物（mcp-rag / fiat-tools / job-apply / alert-fanout） */
+	hostTools: HostTool[];
 }
 
 /**
@@ -121,7 +116,10 @@ const sha256Default = (s: string): string => createHash("sha256").update(s).dige
 const DEFAULT_MODEL_POLICIES_PATH = fileURLToPath(new URL("../../../config/model_policies.yaml", import.meta.url));
 
 /** 组合根：按 subject 装配 ①~③ 闸门 + 阶段 5 审批工单 + fiat/job-apply 工具 */
-export function buildSession(subject: SessionSubject, opts: SessionFactoryOptions): SessionFactoryResult {
+export async function buildSession(
+	subject: SessionSubject,
+	opts: SessionFactoryOptions,
+): Promise<SessionFactoryResult> {
 	const policies = loadPolicies(opts.policiesPath);
 	const roleAllowed = allowedToolPredicate(policies, subject);
 	// P6-25：toolFilter 与角色谓词 AND —— 子会话据此把工具压到单个视角的只读子集
@@ -136,7 +134,7 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 	const ticketStore = opts.ticketStore ?? new InMemoryTicketStore();
 	const larkClient = opts.larkClient ?? new LocalLarkClient();
 
-	const mcpRag = createMcpRag({
+	const mcpRagTools = await createMcpRagTools({
 		config: ragConfig,
 		clientFactory: opts.ragClientFactory,
 		allowedTools,
@@ -191,11 +189,12 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 		onRoute: opts.onModelRoute,
 	});
 
-	// P6-25：并行告警诊断。需调用方注入子会话 runner 才注册 —— 没有 runner 就没有这个能力。
-	const factories: Array<(pi: ExtensionAPI) => void> = [gate, mcpRag, fiatTools, jobApply, audit, modelRouter];
+	// P9-40 分流装配：L1a 钩子通道（编译期注入）；L1b 工具通道（直接注册进循环）
+	const factories: Array<(pi: ExtensionAPI) => void> = [gate, audit, modelRouter];
+	const hostTools = defineHostTools([...mcpRagTools, ...fiatTools, ...jobApply]);
 	if (opts.diagnosisRunner) {
-		factories.push(
-			createAlertFanout({
+		hostTools.push(
+			...createAlertFanout({
 				runAgent: opts.diagnosisRunner,
 				allowedTools,
 				...(opts.diagnosisAngles ? { angles: opts.diagnosisAngles } : {}),
@@ -215,5 +214,6 @@ export function buildSession(subject: SessionSubject, opts: SessionFactoryOption
 		sessionId,
 		modelPolicies,
 		extensionFactories: factories,
+		hostTools,
 	};
 }

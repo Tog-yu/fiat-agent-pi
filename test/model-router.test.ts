@@ -26,6 +26,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	applyRoute,
+	createModelRouter,
+	type ModelRouterDeps,
+	type RouteApplied,
+	registerProviders,
+	registryResolver,
+} from "../src/server/host/l1a/model-router.ts";
+import { hostToolsAsFactory } from "../src/server/host/tools.ts";
+import {
 	classifyTask,
 	loadModelPolicies,
 	type ModelPolicies,
@@ -36,14 +45,6 @@ import {
 	routeModel,
 } from "../src/server/models/router.ts";
 import { buildSession } from "../src/server/session/factory.ts";
-import {
-	applyRoute,
-	createModelRouter,
-	type ModelRouterDeps,
-	type RouteApplied,
-	registerProviders,
-	registryResolver,
-} from "../workspace/pi-extensions/model-router/index.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
 const MODEL_POLICY_PATH = fileURLToPath(new URL("../config/model_policies.yaml", import.meta.url));
@@ -341,7 +342,7 @@ describe("P6-24 端到端（faux + buildSession）", () => {
 	 */
 	async function setup(prompt: string) {
 		const routes: RouteApplied[] = [];
-		const sess = buildSession(
+		const sess = await buildSession(
 			{ user: { id: "u1", role: "ops" }, environment: "dev" },
 			{
 				policiesPath: POLICY_PATH,
@@ -360,7 +361,7 @@ describe("P6-24 端到端（faux + buildSession）", () => {
 				agentDir: tempDir,
 				authStorage,
 				resourceLoaderOptions: {
-					extensionFactories: sess.extensionFactories,
+					extensionFactories: [...sess.extensionFactories, hostToolsAsFactory(sess.hostTools)],
 					noSkills: true,
 					noPromptTemplates: true,
 					noThemes: true,
@@ -417,7 +418,7 @@ describe("P6-24 端到端（faux + buildSession）", () => {
 
 	it("未注入 resolver 时 fail-safe：不切模型，会话照常跑完", async () => {
 		const routes: RouteApplied[] = [];
-		const sess = buildSession(
+		const sess = await buildSession(
 			{ user: { id: "u1", role: "ops" }, environment: "dev" },
 			{
 				policiesPath: POLICY_PATH,
@@ -434,7 +435,7 @@ describe("P6-24 端到端（faux + buildSession）", () => {
 				agentDir: tempDir,
 				authStorage,
 				resourceLoaderOptions: {
-					extensionFactories: sess.extensionFactories,
+					extensionFactories: [...sess.extensionFactories, hostToolsAsFactory(sess.hostTools)],
 					noSkills: true,
 					noPromptTemplates: true,
 					noThemes: true,

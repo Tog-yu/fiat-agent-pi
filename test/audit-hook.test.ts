@@ -22,10 +22,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { InMemoryAuditClient } from "../src/server/audit/client.ts";
+import { createAuditHook } from "../src/server/host/l1a/audit-hook.ts";
+import { createPermissionGate } from "../src/server/host/l1a/permission-gate.ts";
+import { createMcpRagTools, type McpClientLike, type RagStatus } from "../src/server/host/l1b/mcp-rag.ts";
+import { hostToolsAsFactory } from "../src/server/host/tools.ts";
 import { LocalPolicyClient } from "../src/server/policy/client.ts";
-import { createAuditHook } from "../workspace/pi-extensions/audit-hook/index.ts";
-import { createMcpRag, type McpClientLike, type RagStatus } from "../workspace/pi-extensions/mcp-rag/index.ts";
-import { createPermissionGate } from "../workspace/pi-extensions/permission-gate/index.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
 
@@ -94,11 +95,13 @@ describe("P2-11/P2-12 audit-hook + 三道闸门联动", () => {
 							sessionId: "sess-test",
 							audit,
 						}),
-						createMcpRag({
-							config: { transport: "stdio" },
-							clientFactory: () => client,
-							onStatus: (s, d) => notify?.(s, d),
-						}),
+						hostToolsAsFactory(
+							await createMcpRagTools({
+								config: { transport: "stdio" },
+								clientFactory: () => client,
+								onStatus: (s, d) => notify?.(s, d),
+							}),
+						),
 						createAuditHook({
 							audit,
 							user: { id: "u1", role },

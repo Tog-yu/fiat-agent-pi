@@ -27,8 +27,8 @@ import {
 	renderReport,
 } from "../src/server/diagnosis/plan.ts";
 import { createDiagnosisRunner } from "../src/server/diagnosis/sessionRunner.ts";
+import { ALERT_DIAGNOSIS_TOOL, type AlertFanoutDeps, createAlertFanout } from "../src/server/host/l1b/alert-fanout.ts";
 import { buildSession } from "../src/server/session/factory.ts";
-import { ALERT_DIAGNOSIS_TOOL, createAlertFanout } from "../workspace/pi-extensions/alert-fanout/index.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
 
@@ -233,22 +233,26 @@ describe("P6-25 扩展：fiat_alert_diagnosis", () => {
 
 	it("闸门①允许时注册工具", () => {
 		const { pi, registered } = fakePi();
-		createAlertFanout({ runAgent: async () => "x", allowedTools: () => true })(pi);
+		for (const t of createAlertFanout({ runAgent: async () => "x", allowedTools: () => true }))
+			(pi.registerTool as (t: CapturedTool) => void)(t as unknown as CapturedTool);
 		expect(registered.map((t) => t.name)).toEqual([ALERT_DIAGNOSIS_TOOL]);
 	});
 
 	it("闸门①拒绝 → 不注册，模型根本看不到", () => {
 		const { pi, registered } = fakePi();
-		createAlertFanout({
+		const deps: AlertFanoutDeps = {
 			runAgent: async () => "x",
 			allowedTools: (n) => n !== ALERT_DIAGNOSIS_TOOL,
-		})(pi);
+		};
+		for (const t of createAlertFanout(deps))
+			(pi.registerTool as (t: CapturedTool) => void)(t as unknown as CapturedTool);
 		expect(registered).toEqual([]);
 	});
 
 	it("执行：并发跑完各视角并聚合成报告", async () => {
 		const { pi, registered } = fakePi();
-		createAlertFanout({ runAgent: async (t) => `${t.name} 结论`, allowedTools: () => true })(pi);
+		for (const t of createAlertFanout({ runAgent: async (t) => `${t.name} 结论`, allowedTools: () => true }))
+			(pi.registerTool as (t: CapturedTool) => void)(t as unknown as CapturedTool);
 
 		const result = await execFirst(registered, { title: "支付网关 5xx 突增", service: "payment-gateway" });
 		const text = result.content[0]?.text ?? "";
@@ -261,13 +265,15 @@ describe("P6-25 扩展：fiat_alert_diagnosis", () => {
 
 	it("某视角失败照常出报告，并在正文标注失败", async () => {
 		const { pi, registered } = fakePi();
-		createAlertFanout({
+		const deps: AlertFanoutDeps = {
 			runAgent: async (t) => {
 				if (t.name === "logs") throw new Error("ES 不可用");
 				return "ok";
 			},
 			allowedTools: () => true,
-		})(pi);
+		};
+		for (const t of createAlertFanout(deps))
+			(pi.registerTool as (t: CapturedTool) => void)(t as unknown as CapturedTool);
 
 		const result = await execFirst(registered, { title: "支付告警" });
 		const text = result.content[0]?.text ?? "";
@@ -280,13 +286,15 @@ describe("P6-25 扩展：fiat_alert_diagnosis", () => {
 		const { pi, registered } = fakePi();
 		let called = 0;
 		// 只允许工具自身 → 各视角的取证工具全被过滤 → 空计划
-		createAlertFanout({
+		const deps: AlertFanoutDeps = {
 			runAgent: async () => {
 				called += 1;
 				return "x";
 			},
 			allowedTools: (n) => n === ALERT_DIAGNOSIS_TOOL,
-		})(pi);
+		};
+		for (const t of createAlertFanout(deps))
+			(pi.registerTool as (t: CapturedTool) => void)(t as unknown as CapturedTool);
 
 		const result = await execFirst(registered, { title: "支付告警" });
 		expect(result.details.skipped).toBe("no-available-tools");
@@ -295,11 +303,13 @@ describe("P6-25 扩展：fiat_alert_diagnosis", () => {
 
 	it("maxTasks 截断视角数量，防止 token 预算被打爆", async () => {
 		const { pi, registered } = fakePi();
-		createAlertFanout({
+		const deps: AlertFanoutDeps = {
 			runAgent: async () => "x",
 			allowedTools: () => true,
 			maxTasks: 2,
-		})(pi);
+		};
+		for (const t of createAlertFanout(deps))
+			(pi.registerTool as (t: CapturedTool) => void)(t as unknown as CapturedTool);
 
 		const result = await execFirst(registered, { title: "支付告警" });
 		expect(result.details.summary?.total).toBe(2);
@@ -326,8 +336,8 @@ describe("P6-25 端到端：createDiagnosisRunner 起真实子会话", () => {
 	it("子会话跑完单个视角并取回结论文本（走 buildSession，继承三道闸门）", async () => {
 		const runner = createDiagnosisRunner({
 			// 子会话由同一个 buildSession 构造 → 共享 subject 与三道闸门
-			buildChildSession: () =>
-				buildSession({ user: { id: "u1", role: "ops" }, environment: "dev" }, { policiesPath: POLICY_PATH }),
+			buildChildSession: async () =>
+				await buildSession({ user: { id: "u1", role: "ops" }, environment: "dev" }, { policiesPath: POLICY_PATH }),
 			model: faux.getModel(),
 			authStorage: AuthStorage.inMemory(),
 			runtimeApiKey: "faux-key",

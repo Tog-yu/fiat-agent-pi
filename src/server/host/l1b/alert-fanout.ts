@@ -1,15 +1,20 @@
 /**
- * alert-fanout —— L1 扩展：并行告警诊断（P6-25）。
+ * alert-fanout —— L1b 并行告警诊断工具模块（P9-47，原 workspace/pi-extensions/alert-fanout）。
+ *
+ * **P9-40 新契约**（工具模块）：去掉 `ExtensionAPI` 依赖，工厂直接返回 `HostTool[]`。
+ * ⚠️ 名字像钩子，实测是**纯工具**（零 `pi.on`、单个 defineTool）——「fanout」指 L2 侧
+ * `diagnosis/{plan,fanout}.ts` 的并发编排，本模块只暴露 `fiat_alert_diagnosis` 一个工具
+ * 并渲染报告。分流依据见 §3。
  *
  * **为什么不复用 Pi 官方 subagent 扩展**：它走子进程（`pi --mode json -p --no-session`），
  * 子进程从磁盘加载 `.pi/extensions`，而本仓库所有 fiat 扩展都是依赖注入工厂、
  * 没有 default 自配置入口 —— 子进程里权限闸门与审计整条丢失。法币场景不可接受。
- * 所以这里只做「注册一个工具 + 编排」，真正的并发由 L2 进程内 fan-out 完成：
- * 每个视角一个独立 AgentSession，共享 subject 与三道闸门，审计落在同一条链上。
+ * 所以这里只做「暴露一个工具 + 编排」，真正的并发由 L2 进程内 fan-out 完成：
+ * 每个视角一个独立子会话，共享 subject 与三道闸门，审计落在同一条链上。
  *
- * 本扩展职责边界（与权限闸门同构）：
+ * 职责边界（与权限闸门同构）：
  *   - L2 `src/server/diagnosis/{plan,fanout}.ts` 算拆分与并发编排（纯函数、可离线测）
- *   - L1 本扩展只做两件事：注册 `fiat_alert_diagnosis`、把结果渲染成报告返回给模型
+ *   - L1b 本模块只做两件事：暴露 `fiat_alert_diagnosis`、把结果渲染成报告返回给模型
  *
  * 注册名 `fiat_alert_diagnosis`：policyToolName 剥前缀后命中
  * config/tool_policies.yaml 既有的 `alert_diagnosis`（L1，oncall/ops/viewer 全环境可用），
@@ -17,7 +22,7 @@
  */
 
 import { Type } from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool } from "@earendil-works/pi-coding-agent";
 import {
 	DEFAULT_CONCURRENCY,
 	DEFAULT_TIMEOUT_MS,
@@ -26,14 +31,16 @@ import {
 	runFanout,
 	type TaskOutcome,
 	type TaskStatus,
-} from "../../../src/server/diagnosis/fanout.ts";
+} from "../../diagnosis/fanout.ts";
 import {
 	type AlertInput,
 	DEFAULT_ANGLES,
 	type DiagnosisAngle,
 	diagnosisPlan,
 	renderReport,
-} from "../../../src/server/diagnosis/plan.ts";
+} from "../../diagnosis/plan.ts";
+import type { HostTool } from "../tools.ts";
+import { hostToolFromDefinition } from "../tools.ts";
 
 /** Pi 注册名；剥前缀后命中 tool_policies.yaml 的 alert_diagnosis */
 export const ALERT_DIAGNOSIS_TOOL = "fiat_alert_diagnosis";
@@ -66,12 +73,12 @@ export interface AlertFanoutDeps {
 	maxTasks?: number;
 }
 
-export function createAlertFanout(deps: AlertFanoutDeps) {
-	return (pi: ExtensionAPI) => {
-		// 闸门①：角色白名单拒绝 → 不注册，模型根本看不到
-		if (deps.allowedTools && !deps.allowedTools(ALERT_DIAGNOSIS_TOOL)) return;
+export function createAlertFanout(deps: AlertFanoutDeps): HostTool[] {
+	// 闸门①：角色白名单拒绝 → 不注册，模型根本看不到
+	if (deps.allowedTools && !deps.allowedTools(ALERT_DIAGNOSIS_TOOL)) return [];
 
-		pi.registerTool(
+	return [
+		hostToolFromDefinition(
 			defineTool({
 				name: ALERT_DIAGNOSIS_TOOL,
 				label: "Fiat Alert Diagnosis",
@@ -134,6 +141,6 @@ export function createAlertFanout(deps: AlertFanoutDeps) {
 					};
 				},
 			}),
-		);
-	};
+		),
+	];
 }

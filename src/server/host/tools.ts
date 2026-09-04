@@ -17,11 +17,45 @@
  */
 
 import type { Agent, AgentTool } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
 /** pi-host 工具模块暴露的工具形状（去掉 ExtensionAPI 的 L1b 契约雏形，正式契约 P9-40） */
 // biome-ignore lint/suspicious/noExplicitAny: 对齐 pi 自身口径——AgentState.tools 即 AgentTool<any>[]，具体 schema 工具可赋入通用列表
 export type HostTool = AgentTool<any>;
+
+/**
+ * ToolDefinition（Pi 扩展工具定义，execute 5 参含 ctx）→ AgentTool（宿主 4 参）。
+ * 对标官方 `wrapToolDefinition`（core/tools/tool-definition-wrapper.js，未从包入口导出）：
+ * 丢弃 renderCall/renderResult 等 TUI 渲染字段，execute 末参补 undefined ctx。
+ * P9-40 契约下 L1b 工具模块用它把 `defineTool` 产物收编为 `HostTool`。
+ */
+export function hostToolFromDefinition<TDetails = unknown>(
+	// biome-ignore lint/suspicious/noExplicitAny: 对齐 pi 自身口径——ToolDefinition 泛型默认 any，收编时抹平为 HostTool
+	definition: ToolDefinition<any, TDetails>,
+): HostTool {
+	return {
+		name: definition.name,
+		label: definition.label,
+		description: definition.description,
+		parameters: definition.parameters,
+		prepareArguments: definition.prepareArguments,
+		executionMode: definition.executionMode,
+		execute: (toolCallId, params, signal, onUpdate) =>
+			definition.execute(toolCallId, params, signal, onUpdate, undefined as never),
+	};
+}
+
+/**
+ * 过渡兼容（P9-40~P9-49）：把 HostTool[] 包成 extension factory（`(pi) => void`），
+ * 供仍走 `createAgentSession` 扩展注册路径的调用方（旧测试 / pi -e 遗留入口）使用。
+ * 入口切换（P9-49）后内嵌循环直接消费 HostTool[]，此适配器可删。
+ */
+export function hostToolsAsFactory(tools: readonly HostTool[]): (pi: ExtensionAPI) => void {
+	return (pi) => {
+		for (const tool of tools) pi.registerTool(tool);
+	};
+}
 
 /**
  * 工具模块契约落点：恒等返回并做最小防呆校验。

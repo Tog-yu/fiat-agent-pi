@@ -119,7 +119,7 @@ describe("P8-40 关闭自动发现 + 通道自测", () => {
 			]);
 			const host = new PiHostLoop({
 				model: faux.getModel(),
-				getApiKey: () => " rogue".trim() + "-key",
+				getApiKey: () => `${" rogue".trim()}-key`,
 				tools: [makeTool("fiat_echo", [])],
 				...hooks,
 			});

@@ -107,7 +107,7 @@ function makeDiagnose(policiesPath: string, sharedAudit: AuditClient) {
 	return async (input: DiagnosisInput): Promise<string> => {
 		// —— Pi 运行时依赖：仅诊断路径动态加载，离线命令不触发 ——
 		const { AuthStorage, getAgentDir, ModelRegistry } = await import("@earendil-works/pi-coding-agent");
-		const { registryResolver } = await import("../../../workspace/pi-extensions/model-router/index.ts");
+		const { registryResolver } = await import("../host/l1a/model-router.ts");
 		const { createDiagnosisRunner } = await import("../../../src/server/diagnosis/sessionRunner.ts");
 		const { buildSession } = await import("../../../src/server/session/factory.ts");
 
@@ -139,15 +139,15 @@ function makeDiagnose(policiesPath: string, sharedAudit: AuditClient) {
 		const roleAllowed = allowedToolPredicate(policies, subject);
 
 		const runOne = createDiagnosisRunner({
-			buildChildSession: (task) => {
-				const r = buildSession(subject, {
+			buildChildSession: async (task) => {
+				const r = await buildSession(subject, {
 					policiesPath,
 					auditClient: sharedAudit,
 					modelResolver: resolve,
 					// 子会话把工具收敛到单个视角的只读子集（registered name → logical 归一后比对）
 					toolFilter: (registeredName) => task.tools.includes(policyToolName(registeredName)),
 				});
-				return { extensionFactories: r.extensionFactories, sessionId: r.sessionId };
+				return { extensionFactories: r.extensionFactories, hostTools: r.hostTools, sessionId: r.sessionId };
 			},
 			model,
 			authStorage,

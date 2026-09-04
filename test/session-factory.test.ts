@@ -6,9 +6,9 @@
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+import type { McpClientLike, RagStatus } from "../src/server/host/l1b/mcp-rag.ts";
 import { loadPolicies } from "../src/server/policy/engine.ts";
 import { allowedToolPredicate, buildSession } from "../src/server/session/factory.ts";
-import type { McpClientLike, RagStatus } from "../workspace/pi-extensions/mcp-rag/index.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
 
@@ -66,16 +66,16 @@ describe("buildSession 组合根 —— ①裁剪真正落地到扩展", () => {
 			on: vi.fn(),
 		} as unknown as ExtensionAPI;
 
-		const { extensionFactories } = buildSession(
+		const { hostTools } = await buildSession(
 			{ user: { id: "u", role: "admin" }, environment: "dev" },
 			{ policiesPath: POLICY_PATH, ragClientFactory: () => mockClient(), ragOnStatus: (s, d) => notify?.(s, d) },
 		);
 
-		// 只驱动 mcp-rag 扩展（第二个工厂），验证白名单裁剪
-		extensionFactories[1](pi);
+		// P9-42：mcp-rag 走 L1b hostTools 通道，白名单裁剪在工厂内完成
 		const status = await statusReady;
 		expect(status.s).toBe("ready");
-		expect(registered).toEqual([]);
+		expect(hostTools.map((t) => t.name)).toEqual([]);
+		void pi;
 	});
 
 	it("viewer 会话：mcp-rag 正常注册 1 个工具（mcp_rag_query_knowledge_hub）", async () => {
@@ -90,14 +90,17 @@ describe("buildSession 组合根 —— ①裁剪真正落地到扩展", () => {
 			on: vi.fn(),
 		} as unknown as ExtensionAPI;
 
-		const { extensionFactories } = buildSession(
+		const { hostTools } = await buildSession(
 			{ user: { id: "u", role: "viewer" }, environment: "dev" },
 			{ policiesPath: POLICY_PATH, ragClientFactory: () => mockClient(), ragOnStatus: (s, d) => notify?.(s, d) },
 		);
 
-		extensionFactories[1](pi);
 		const status = await statusReady;
 		expect(status.s).toBe("ready");
-		expect(registered).toEqual(["mcp_rag_query_knowledge_hub"]);
+		// hostTools 还包含 viewer 可用的 fiat 只读工具；这里只断言 mcp_rag 注册数量
+		expect(hostTools.filter((t) => t.name.startsWith("mcp_rag_")).map((t) => t.name)).toEqual([
+			"mcp_rag_query_knowledge_hub",
+		]);
+		void pi;
 	});
 });

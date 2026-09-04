@@ -9,8 +9,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { AuditClient, AuditOutcome } from "../../../src/server/audit/client.ts";
-import type { FiatUser } from "../../../src/server/policy/engine.ts";
+import type { AuditClient, AuditOutcome } from "../../audit/client.ts";
+import type { FiatUser } from "../../policy/engine.ts";
 
 export interface AuditHookDeps {
 	audit: AuditClient;

@@ -22,7 +22,7 @@ import {
 	piApiName,
 	type RouteDecision,
 	routeModel,
-} from "../../../src/server/models/router.ts";
+} from "../../models/router.ts";
 
 /** `provider/model` → Model 对象。生产注入 ModelRegistry.find，测试注入 fake。 */
 export type ModelResolver = (modelRef: string) => Model<Api> | undefined;

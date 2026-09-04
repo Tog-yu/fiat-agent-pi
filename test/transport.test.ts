@@ -9,7 +9,7 @@
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { describe, expect, it } from "vitest";
-import { createTransport, type RagMcpConfig, ragConfigFromEnv } from "../workspace/pi-extensions/mcp-rag/transport.ts";
+import { createTransport, type RagMcpConfig, ragConfigFromEnv } from "../src/server/host/l1b/mcp-rag-transport.ts";
 
 describe("P6-23 RAG MCP transport 切换（stdio ⇄ http）", () => {
 	it("createTransport: stdio 返回 StdioClientTransport", () => {

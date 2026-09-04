@@ -15,7 +15,8 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createMcpRag, type McpClientLike, type RagStatus } from "../workspace/pi-extensions/mcp-rag/index.ts";
+import { createMcpRagTools, type McpClientLike, type RagStatus } from "../src/server/host/l1b/mcp-rag.ts";
+import { hostToolsAsFactory } from "../src/server/host/tools.ts";
 
 interface CapturedTool {
 	name: string;
@@ -44,15 +45,6 @@ function mockClient(overrides: Partial<McpClientLike> = {}): McpClientLike {
 		close: async () => {},
 		...overrides,
 	};
-}
-
-/** 等待扩展 bootstrap 完成（onStatus 首次回调） */
-function waitForStatus(
-	onStatus: (fn: (s: RagStatus, d: string) => void) => void,
-): Promise<{ status: RagStatus; detail: string }> {
-	return new Promise((resolve) => {
-		onStatus((status, detail) => resolve({ status, detail }));
-	});
 }
 
 describe("P1-5/P1-6/P1-7 mcp-rag 扩展", () => {
@@ -101,11 +93,13 @@ describe("P1-5/P1-6/P1-7 mcp-rag 扩展", () => {
 				authStorage,
 				resourceLoaderOptions: {
 					extensionFactories: [
-						createMcpRag({
-							config: { transport: "stdio" },
-							clientFactory: () => client,
-							onStatus: (s, d) => notify?.(s, d),
-						}),
+						hostToolsAsFactory(
+							await createMcpRagTools({
+								config: { transport: "stdio" },
+								clientFactory: () => client,
+								onStatus: (s, d) => notify?.(s, d),
+							}),
+						),
 					],
 					noSkills: true,
 					noPromptTemplates: true,
@@ -167,19 +161,21 @@ describe("P1-5/P1-6/P1-7 mcp-rag 扩展", () => {
 			agentDir,
 			settingsManager,
 			extensionFactories: [
-				createMcpRag({
-					config: { transport: "stdio" },
-					clientFactory: () =>
-						mockClient({
-							connect: async () => {
-								throw new Error("ECONNREFUSED");
-							},
-						}),
-					onStatus: (s, d) => {
-						statuses.push({ status: s, detail: d });
-						notify?.(s, d);
-					},
-				}),
+				hostToolsAsFactory(
+					await createMcpRagTools({
+						config: { transport: "stdio" },
+						clientFactory: () =>
+							mockClient({
+								connect: async () => {
+									throw new Error("ECONNREFUSED");
+								},
+							}),
+						onStatus: (s, d) => {
+							statuses.push({ status: s, detail: d });
+							notify?.(s, d);
+						},
+					}),
+				),
 			],
 		});
 		await resourceLoader.reload();
@@ -217,8 +213,8 @@ describe("P1-5/P1-6/P1-7 mcp-rag 扩展", () => {
 			on: vi.fn(),
 		} as unknown as ExtensionAPI;
 
-		// isError 场景
-		createMcpRag({
+		// isError 场景（P9-42：工厂 await 化后 onStatus 在返回前已同步触发，无需再等）
+		for (const t of await createMcpRagTools({
 			config: { transport: "stdio" },
 			clientFactory: () =>
 				mockClient({
@@ -228,10 +224,9 @@ describe("P1-5/P1-6/P1-7 mcp-rag 扩展", () => {
 					}),
 				}),
 			onStatus: (s, d) => notify?.(s, d),
-		})(pi);
-		await waitForStatus((fn) => {
-			notify = fn;
-		});
+		})) {
+			(pi.registerTool as (t: CapturedTool) => void)(t as unknown as CapturedTool);
+		}
 		const deniedTool = registered.find((t) => t.name === "mcp_rag_query_knowledge_hub");
 		expect(deniedTool).toBeDefined();
 		if (!deniedTool) throw new Error("denied tool not registered");
@@ -241,18 +236,19 @@ describe("P1-5/P1-6/P1-7 mcp-rag 扩展", () => {
 
 		// 超时场景（不 resolve 的 promise + 极短超时）
 		registered.length = 0;
+		// 闭包先建、再重置 notify——避免 TS 把 notify 窄化成 undefined（?. 调用目标变 never）
+		const timeoutNotify = (s: RagStatus, d: string) => notify?.(s, d);
 		notify = undefined;
-		createMcpRag({
+		for (const t of await createMcpRagTools({
 			config: { transport: "stdio", timeoutMs: 20 },
 			clientFactory: () =>
 				mockClient({
 					callTool: () => new Promise(() => {}),
 				}),
-			onStatus: (s, d) => notify?.(s, d),
-		})(pi);
-		await waitForStatus((fn) => {
-			notify = fn;
-		});
+			onStatus: timeoutNotify,
+		})) {
+			(pi.registerTool as (t: CapturedTool) => void)(t as unknown as CapturedTool);
+		}
 		const timeoutTool = registered.find((t) => t.name === "mcp_rag_query_knowledge_hub");
 		expect(timeoutTool).toBeDefined();
 		if (!timeoutTool) throw new Error("timeout tool not registered");

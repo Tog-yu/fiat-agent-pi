@@ -2,7 +2,7 @@
  * 真实 RAG server 的 stdio 握手冒烟（不在 CI 里跑，手工验证 transport 真实路径）。
  * 用后即删。
  */
-import { createMcpRag } from "../workspace/pi-extensions/mcp-rag/index.ts";
+import { createMcpRag } from "../src/server/host/l1b/mcp-rag.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const registered: string[] = [];

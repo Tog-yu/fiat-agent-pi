@@ -21,6 +21,7 @@ import {
 	type ExtensionAPI,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { hostToolsAsFactory } from "../host/tools.ts";
 import type { RunOne } from "./fanout.ts";
 import type { DiagnosisTask } from "./plan.ts";
 
@@ -28,10 +29,12 @@ import type { DiagnosisTask } from "./plan.ts";
 export interface ChildSessionBundle {
 	extensionFactories: Array<(pi: ExtensionAPI) => void>;
 	sessionId: string;
+	/** P9-42：L1b 工具通道产物（过渡期经 hostToolsAsFactory 注册进遗留会话路径）；缺省无工具 */
+	hostTools?: import("../host/tools.ts").HostTool[];
 }
 
-/** 按视角构造子会话：视角的 tools 应在此收敛为只读子集 */
-export type BuildChildSession = (task: DiagnosisTask) => ChildSessionBundle;
+/** 按视角构造子会话：视角的 tools 应在此收敛为只读子集（P9-42 起组合根 async，允许 Promise） */
+export type BuildChildSession = (task: DiagnosisTask) => ChildSessionBundle | Promise<ChildSessionBundle>;
 
 export interface DiagnosisRunnerDeps {
 	buildChildSession: BuildChildSession;
@@ -45,7 +48,7 @@ export interface DiagnosisRunnerDeps {
 
 export function createDiagnosisRunner(deps: DiagnosisRunnerDeps): RunOne {
 	return async (task: DiagnosisTask) => {
-		const bundle = deps.buildChildSession(task);
+		const bundle = await deps.buildChildSession(task);
 		if (deps.runtimeApiKey !== undefined) {
 			deps.authStorage.setRuntimeApiKey(deps.model.provider, deps.runtimeApiKey);
 		}
@@ -56,7 +59,10 @@ export function createDiagnosisRunner(deps: DiagnosisRunnerDeps): RunOne {
 				agentDir: deps.agentDir,
 				authStorage: deps.authStorage,
 				resourceLoaderOptions: {
-					extensionFactories: bundle.extensionFactories,
+					extensionFactories: [
+						...bundle.extensionFactories,
+						...(bundle.hostTools ? [hostToolsAsFactory(bundle.hostTools)] : []),
+					],
 					noSkills: true,
 					noPromptTemplates: true,
 					noThemes: true,

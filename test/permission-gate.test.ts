@@ -23,9 +23,10 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createPermissionGate } from "../src/server/host/l1a/permission-gate.ts";
+import { createMcpRagTools, type McpClientLike, type RagStatus } from "../src/server/host/l1b/mcp-rag.ts";
+import { hostToolsAsFactory } from "../src/server/host/tools.ts";
 import { LocalPolicyClient } from "../src/server/policy/client.ts";
-import { createMcpRag, type McpClientLike, type RagStatus } from "../workspace/pi-extensions/mcp-rag/index.ts";
-import { createPermissionGate } from "../workspace/pi-extensions/permission-gate/index.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
 
@@ -104,11 +105,13 @@ describe("P2-9 permission-gate 端到端（faux + LocalPolicyClient）", () => {
 							environment: "dev",
 							sessionId: "sess-test",
 						}),
-						createMcpRag({
-							config: { transport: "stdio" },
-							clientFactory: () => client,
-							onStatus: (s, d) => notify?.(s, d),
-						}),
+						hostToolsAsFactory(
+							await createMcpRagTools({
+								config: { transport: "stdio" },
+								clientFactory: () => client,
+								onStatus: (s, d) => notify?.(s, d),
+							}),
+						),
 					],
 					noSkills: true,
 					noPromptTemplates: true,

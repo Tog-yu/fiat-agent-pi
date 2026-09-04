@@ -23,10 +23,11 @@ import {
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { InMemoryAuditClient } from "../src/server/audit/client.ts";
 import { LocalFiatClient } from "../src/server/fiat-tools/client.ts";
+import { createAuditHook } from "../src/server/host/l1a/audit-hook.ts";
+import { createPermissionGate } from "../src/server/host/l1a/permission-gate.ts";
+import { createFiatTools } from "../src/server/host/l1b/fiat-tools.ts";
+import { hostToolsAsFactory } from "../src/server/host/tools.ts";
 import { LocalPolicyClient } from "../src/server/policy/client.ts";
-import { createAuditHook } from "../workspace/pi-extensions/audit-hook/index.ts";
-import { createFiatTools } from "../workspace/pi-extensions/fiat-tools/index.ts";
-import { createPermissionGate } from "../workspace/pi-extensions/permission-gate/index.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
 
@@ -77,7 +78,7 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 							sessionId: "sess-test",
 							audit,
 						}),
-						createFiatTools({ client: wrapped }),
+						hostToolsAsFactory(createFiatTools({ client: wrapped })),
 						createAuditHook({ audit, user: { id: "u1", role }, environment, sessionId: "sess-test" }),
 					],
 					noSkills: true,

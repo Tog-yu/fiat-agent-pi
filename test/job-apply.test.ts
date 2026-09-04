@@ -19,6 +19,7 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { hostToolsAsFactory } from "../src/server/host/tools.ts";
 import { buildSession } from "../src/server/session/factory.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
@@ -39,7 +40,10 @@ describe("P5-20 fiat_job_apply 端到端", () => {
 	});
 
 	async function setup() {
-		const sess = buildSession({ user: { id: "u1", role: "ops" }, environment: "dev" }, { policiesPath: POLICY_PATH });
+		const sess = await buildSession(
+			{ user: { id: "u1", role: "ops" }, environment: "dev" },
+			{ policiesPath: POLICY_PATH },
+		);
 		const authStorage = AuthStorage.inMemory();
 		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
 
@@ -49,7 +53,7 @@ describe("P5-20 fiat_job_apply 端到端", () => {
 				agentDir: tempDir,
 				authStorage,
 				resourceLoaderOptions: {
-					extensionFactories: sess.extensionFactories,
+					extensionFactories: [...sess.extensionFactories, hostToolsAsFactory(sess.hostTools)],
 					noSkills: true,
 					noPromptTemplates: true,
 					noThemes: true,
