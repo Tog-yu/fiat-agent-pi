@@ -12,6 +12,7 @@ import type { ApprovalTicketRecord } from "../approval/ticket.ts";
 import type { AuditQuery, AuditReader } from "../audit/reader.ts";
 import type { ToolPolicy } from "../policy/engine.ts";
 import { intFlag, parseArgs } from "./args.ts";
+import type { ChatFactory } from "./chat.ts";
 import { allowedTools, HELP, renderAudit, renderTickets, renderTools } from "./commands.ts";
 
 export interface DiagnosisInput {
@@ -29,6 +30,11 @@ export interface CliDeps {
 	rejectTicket: (id: string, reason?: string) => Promise<ApprovalTicketRecord>;
 	/** 并行告警诊断；未配置模型时为 undefined —— 该命令明确提示，而不是静默失败 */
 	diagnose?: (input: DiagnosisInput) => Promise<string>;
+	/**
+	 * P9-49 入口切换：pi-host 驱动的交互会话（`fiat chat`）。
+	 * 未配置 FIAT_MODEL 时为 undefined —— 与 diagnose 同口径明确提示。
+	 */
+	chat?: ChatFactory;
 }
 
 export interface CliIo {
@@ -46,6 +52,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps, io: CliIo):
 	}
 
 	switch (command) {
+		case "chat":
+			return cmdChat(positional, flags, deps, io);
 		case "diagnose":
 			return cmdDiagnose(positional, flags, deps, io);
 		case "audit":
@@ -61,6 +69,66 @@ export async function runCli(argv: readonly string[], deps: CliDeps, io: CliIo):
 		default:
 			io.err(`未知命令：${command}\n\n${HELP}`);
 			return 1;
+	}
+}
+
+/**
+ * P9-49 入口切换：`fiat chat` —— pi-host 内嵌循环驱动的交互会话。
+ *
+ * 单参数模式（CI / 脚本友好）：`fiat chat "查一下返现规则"` 跑一轮即退出；
+ * 交互模式（无参数）：REPL，exit / quit 退出，空行跳过。
+ * `--session <path>` 继续既有会话文件。
+ */
+async function cmdChat(
+	positional: readonly string[],
+	_flags: Record<string, string>,
+	deps: CliDeps,
+	io: CliIo,
+): Promise<number> {
+	if (!deps.chat) {
+		io.err("未配置模型：chat 需要起内嵌会话，请设置 FIAT_MODEL=provider/model 及对应密钥。");
+		return 1;
+	}
+	const subject = {
+		user: { id: process.env.FIAT_USER_ID ?? "cli", role: process.env.FIAT_ROLE ?? "ops" },
+		environment: process.env.FIAT_ENV ?? "dev",
+	};
+
+	let session: Awaited<ReturnType<NonNullable<CliDeps["chat"]>>>;
+	try {
+		session = await deps.chat(subject, `chat-${Date.now()}`);
+	} catch (e) {
+		io.err(`会话启动失败：${errText(e)}`);
+		return 1;
+	}
+	io.out(`会话 ${session.sessionId} 已就绪（${subject.user.role}@${subject.environment}）。exit 退出。`);
+
+	try {
+		const oneShot = positional.join(" ").trim();
+		if (oneShot) {
+			const r = await session.turn(oneShot);
+			io.out(r.ok ? r.reply : `出错：${r.error ?? "未知错误"}`);
+			return r.ok ? 0 : 1;
+		}
+
+		// 交互 REPL：readline 从 stdin 逐行读
+		const readline = await import("node:readline/promises");
+		const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+		for (;;) {
+			const line = (await rl.question("> ")).trim();
+			if (line === "exit" || line === "quit") break;
+			if (line === "") continue;
+			const r = await session.turn(line);
+			if (r.ok) {
+				io.out(r.reply);
+			} else {
+				io.out(`出错：${r.error ?? "未知错误"}`);
+			}
+		}
+		rl.close();
+		return 0;
+	} finally {
+		session.dispose();
 	}
 }
 

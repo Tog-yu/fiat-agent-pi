@@ -27,6 +27,7 @@ import { LocalPolicyClient, type PolicyClient } from "../../../src/server/policy
 import { loadPolicies, policyToolName } from "../../../src/server/policy/engine.ts";
 import type { SessionSubject } from "../../../src/server/session/factory.ts";
 import { allowedToolPredicate } from "../../../src/server/session/predicate.ts";
+import { makeChat } from "./chat.ts";
 import { type CliDeps, type DiagnosisInput, runCli } from "./index.ts";
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -74,6 +75,7 @@ function bootstrapCliDeps(): CliDeps {
 		approveTicket: (id) => approval.approve(id),
 		rejectTicket: (id, reason) => approval.reject(id, reason),
 		diagnose: makeDiagnose(policiesPath, auditClient),
+		chat: makeChat({ policiesPath, auditClient }),
 	};
 }
 

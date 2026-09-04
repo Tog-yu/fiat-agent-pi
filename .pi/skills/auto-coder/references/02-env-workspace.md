@@ -23,16 +23,18 @@ fiat-agent/
   docs/
 ```
 
-软链命令（写进 `scripts/setup.sh`）：
+软链命令（写进 `scripts/setup.sh`；P9-49 起 extensions 软链归档，仅保留 skills）：
 
 ```bash
-cd workspace/.pi && ln -s ../pi-extensions extensions && ln -s ../pi-skills skills
+cd workspace/.pi && ln -sfn ../pi-skills skills
 ```
 
-开发者入口（决策：MVP 保留 Pi 内置 TUI，不自写 CLI）：
+开发者入口（**P9-49 已切换**：`pi -e` 扩展加载器路径归档 → 自研 CLI，由 pi-host 内嵌循环驱动）：
 
 ```bash
-cd fiat-agent/workspace && pi -e ./pi-extensions/index.ts
+npm run cli                                    # fiat <command>
+npm run cli -- chat "查一下返现规则"             # 内嵌会话单轮问答（装配链 src/server/cli/chat.ts）
+npm run cli -- chat                            # 交互 REPL（exit 退出）
 ```
 
 **硬约束：不在 Pi fork 里改任何一行核心代码。** 遇到缺口优先用 extension 解决，解决不了就在 L2 层绕开。
