@@ -31,6 +31,15 @@
 3. **数据范围隔离**：dev/staging 工具绝不可触达 prod 数据；collection / 数据库 schema 由 L2 按策略白名单覆写。
 4. **LLM 不可信边界**：权限判定与审批发生在 L2（LLM 够不着的侧），扩展层只负责暴露工具与转发判定结果。
 
+## 能力组成（L1）
+
+Agent 的能力由「内建扩展 + 工具模块」提供，随 pi-host 内嵌循环装配（入口 `fiat chat`；旧的 `pi -e` 扩展加载器已弃用）：
+
+- **内建 extension（钩子型，编译期注入）**：`permission-gate`（工具调用拦截 / 闸门②）、`audit-hook`（审计落点）、`model-router`（按任务选模型）。
+- **工具模块（直接注册进内嵌循环）**：`mcp_rag.*`（RAG 检索）、`fiat_cashback_*`（返现对账）、`fiat_db_query_*`（只读查询）、`fiat_test_*`（测试自动化）、`fiat_lark_*`（Lark 通知 / 审批）、`fiat_job_apply`（持审批 token 执行生产写）、`fiat_alert_diagnosis`（并行告警诊断）。
+
+三道权限闸门：① 会话级工具裁剪（模型看不到无权工具）→ ② `tool_call` block 拦截 → ③ 服务端 `canExecute`（唯一权威）。
+
 ## 工具命名约定
 
 - `mcp_rag.*`：RAG 检索（知识库 / 历史案例）
