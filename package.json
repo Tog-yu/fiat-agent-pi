@@ -13,13 +13,15 @@
 		"typecheck": "tsgo --noEmit",
 		"lint": "biome check --write .",
 		"test": "vitest --run",
-		"cli": "node --experimental-strip-types src/server/cli/entry.ts"
+		"cli": "node --experimental-strip-types src/server/cli/entry.ts",
+		"dev:pi-local": "node scripts/switch-pi-deps.mjs local && npm install --ignore-scripts --legacy-peer-deps",
+		"dev:pi-registry": "node scripts/switch-pi-deps.mjs registry && npm install --ignore-scripts --legacy-peer-deps"
 	},
 	"dependencies": {
-		"@earendil-works/pi-agent-core": "file:../pi/packages/agent",
-		"@earendil-works/pi-ai": "file:../pi/packages/ai",
-		"@earendil-works/pi-coding-agent": "file:../pi/packages/coding-agent",
-		"@earendil-works/pi-tui": "file:../pi/packages/tui",
+		"@earendil-works/pi-agent-core": "0.80.3",
+		"@earendil-works/pi-ai": "0.80.3",
+		"@earendil-works/pi-coding-agent": "0.80.3",
+		"@earendil-works/pi-tui": "0.80.3",
 		"@modelcontextprotocol/sdk": "^1.30.0",
 		"yaml": "^2.9.0"
 	},
