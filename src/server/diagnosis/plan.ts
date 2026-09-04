@@ -4,7 +4,7 @@
  * **为什么不用 Pi 官方 subagent 扩展**（packages/coding-agent/examples/extensions/subagent）：
  *   它走「子进程」路线 —— 每个 agent 是一个独立 `pi` 进程（index.ts:294
  *   `pi --mode json -p --no-session`，只透传 --model / --tools）。子进程从磁盘加载
- *   `.pi/extensions`，而本仓库所有 fiat 扩展都是**依赖注入工厂**（createXxx(deps)），
+ *   原扩展加载器目录，而本仓库所有 fiat 扩展都是**依赖注入工厂**（createXxx(deps)），
  *   没有 default 自配置入口，子进程里等于什么都注册不上 —— 权限闸门与审计整条丢失。
  *   对法币这种权限敏感场景不可接受。
  *

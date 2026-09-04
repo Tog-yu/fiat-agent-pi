@@ -16,15 +16,8 @@ import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-	AuthStorage,
-	type CreateAgentSessionRuntimeFactory,
-	createAgentSessionFromServices,
-	createAgentSessionRuntime,
-	createAgentSessionServices,
-	SessionManager,
-} from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { bridgeAgentHooks, setupEmbeddedExtensions } from "../src/server/host/extensions.ts";
 import {
 	applyRoute,
 	createModelRouter,
@@ -33,7 +26,7 @@ import {
 	registerProviders,
 	registryResolver,
 } from "../src/server/host/l1a/model-router.ts";
-import { hostToolsAsFactory } from "../src/server/host/tools.ts";
+import { PiHostLoop } from "../src/server/host/loop.ts";
 import {
 	classifyTask,
 	loadModelPolicies,
@@ -338,7 +331,8 @@ describe("P6-24 端到端（faux + buildSession）", () => {
 
 	/**
 	 * 用真实 config/model_policies.yaml。resolveModel 固定返回 faux model ——
-	 * 它的 provider 已注入 runtime key，所以 pi.setModel 会真实成功（applied: true）。
+	 * model-router 的 setModel 副作用经内嵌循环生效（P10-50：`pi.setModel` 拒绝与否
+	 * 由 ExtensionRunner 的 runtime 决定；faux provider 已注册，applied: true）。
 	 */
 	async function setup(prompt: string) {
 		const routes: RouteApplied[] = [];
@@ -352,48 +346,29 @@ describe("P6-24 端到端（faux + buildSession）", () => {
 			},
 		);
 
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
-
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({
-				cwd,
-				agentDir: tempDir,
-				authStorage,
-				resourceLoaderOptions: {
-					extensionFactories: [...sess.extensionFactories, hostToolsAsFactory(sess.hostTools)],
-					noSkills: true,
-					noPromptTemplates: true,
-					noThemes: true,
-				},
-			});
-			return {
-				...(await createAgentSessionFromServices({
-					services,
-					sessionManager,
-					sessionStartEvent,
-					model: faux.getModel(),
-				})),
-				services,
-				diagnostics: services.diagnostics,
-			};
-		};
-
-		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
+		const { runner } = await setupEmbeddedExtensions({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+			factories: sess.extensionFactories,
 		});
-		await runtimeHost.session.bindExtensions({});
+		const hooks = bridgeAgentHooks(runner, { cwd: tempDir });
+
+		const host = new PiHostLoop({
+			model: faux.getModel(),
+			getApiKey: () => "faux-key",
+			sessionId: sess.sessionId,
+			tools: sess.hostTools,
+			...hooks,
+		});
 
 		faux.setResponses([fauxAssistantMessage("ok")]);
 
-		await runtimeHost.session.prompt(prompt);
-		return { runtimeHost, sess, routes };
+		await host.runTurn(prompt);
+		return { host, sess, routes };
 	}
 
 	it("真实会话里 before_agent_start 触发路由：rag_qa 降级到 deepseek 并成功切模型", async () => {
-		const { runtimeHost, routes } = await setup("退款政策是怎么规定的");
+		const { routes } = await setup("退款政策是怎么规定的");
 
 		expect(routes).toHaveLength(1);
 		const r = routes[0];
@@ -402,18 +377,14 @@ describe("P6-24 端到端（faux + buildSession）", () => {
 		expect(r?.decision?.requestedTier).toBe("simple");
 		expect(r?.decision?.choice.provider).toBe("deepseek");
 		expect(r?.decision?.choice.fallbackUsed).toBe(true);
-
-		runtimeHost.dispose();
 	});
 
 	it("告警类 prompt 路由到 gpt，不降级", async () => {
-		const { runtimeHost, routes } = await setup("支付服务告警，请排查");
+		const { routes } = await setup("支付服务告警，请排查");
 
 		expect(routes[0]?.applied).toBe(true);
 		expect(routes[0]?.decision?.choice.provider).toBe("gpt");
 		expect(routes[0]?.decision?.choice.fallbackUsed).toBe(false);
-
-		runtimeHost.dispose();
 	});
 
 	it("未注入 resolver 时 fail-safe：不切模型，会话照常跑完", async () => {
@@ -426,48 +397,26 @@ describe("P6-24 端到端（faux + buildSession）", () => {
 				onModelRoute: (info) => routes.push(info),
 			},
 		);
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
 
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({
-				cwd,
-				agentDir: tempDir,
-				authStorage,
-				resourceLoaderOptions: {
-					extensionFactories: [...sess.extensionFactories, hostToolsAsFactory(sess.hostTools)],
-					noSkills: true,
-					noPromptTemplates: true,
-					noThemes: true,
-				},
-			});
-			return {
-				...(await createAgentSessionFromServices({
-					services,
-					sessionManager,
-					sessionStartEvent,
-					model: faux.getModel(),
-				})),
-				services,
-				diagnostics: services.diagnostics,
-			};
-		};
-
-		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
+		const { runner } = await setupEmbeddedExtensions({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+			factories: sess.extensionFactories,
 		});
-		await runtimeHost.session.bindExtensions({});
+		const host = new PiHostLoop({
+			model: faux.getModel(),
+			getApiKey: () => "faux-key",
+			sessionId: sess.sessionId,
+			tools: sess.hostTools,
+			...bridgeAgentHooks(runner, { cwd: tempDir }),
+		});
 
 		faux.setResponses([fauxAssistantMessage("ok")]);
-		await runtimeHost.session.prompt("支付服务告警，请排查");
+		await host.runTurn("支付服务告警，请排查");
 
 		expect(routes).toHaveLength(1);
 		expect(routes[0]?.applied).toBe(false);
 		expect(routes[0]?.reason).toBe("no-route");
-
-		runtimeHost.dispose();
 	});
 
 	it("createModelRouter 产出的扩展工厂可注册到 ExtensionAPI", () => {

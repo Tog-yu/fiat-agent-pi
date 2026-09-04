@@ -2,7 +2,7 @@
  * P9-40 两类新契约（阶段 9 分流的形式化定义）。
  *
  * 背景（依据 §3 分流表 + §2.5「关键修正·二次」）：
- * 阶段 8 弃用了扩展加载器（目录自动发现 + `pi -e`），7 个 L1 扩展按性质分流：
+ * 阶段 8 弃用了扩展加载器（目录自动发现），7 个 L1 扩展按性质分流：
  *
  * ── L1a 内建 extension（钩子型：permission-gate / audit-hook / model-router）──────────
  *   契约：**保留** Pi `ExtensionFactory` 签名 `(pi) => void | Promise<void>`，仅换装配方式：
@@ -10,7 +10,7 @@
  *   白名单 → `setupEmbeddedExtensions` → 官方 ExtensionRunner）。
  *   - 钩子语义完全复用 Pi agent-loop：`tool_call` 返回 `{ block, reason }` 短路回灌（闸门②）、
  *     `tool_result` 可改写 content/details/isError（审计）、`before_agent_start` 可副作用切模型。
- *   - 内嵌模式与 `pi -e` 的差异：`pi.setModel` / `pi.registerProvider` 依赖宿主在 Runner 上
+ *   - 内嵌模式与原扩展加载器入口的差异：`pi.setModel` / `pi.registerProvider` 依赖宿主在 Runner 上
  *     `bindCore` / provider flush。宿主通过 `bindHostActions`（本文件）显式提供；未绑定时
  *     这些 action 走 Pi 默认的「not initialized」拒绝路径——安全降级，不炸。
  *

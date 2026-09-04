@@ -10,16 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import {
-	AuthStorage,
-	type CreateAgentSessionRuntimeFactory,
-	createAgentSessionFromServices,
-	createAgentSessionRuntime,
-	createAgentSessionServices,
-	SessionManager,
-} from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { hostToolsAsFactory } from "../src/server/host/tools.ts";
+import { bridgeAgentHooks, setupEmbeddedExtensions } from "../src/server/host/extensions.ts";
+import { PiHostLoop } from "../src/server/host/loop.ts";
 import { buildSession } from "../src/server/session/factory.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
@@ -44,49 +37,24 @@ describe("P5-20 fiat_job_apply 端到端", () => {
 			{ user: { id: "u1", role: "ops" }, environment: "dev" },
 			{ policiesPath: POLICY_PATH },
 		);
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
 
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({
-				cwd,
-				agentDir: tempDir,
-				authStorage,
-				resourceLoaderOptions: {
-					extensionFactories: [...sess.extensionFactories, hostToolsAsFactory(sess.hostTools)],
-					noSkills: true,
-					noPromptTemplates: true,
-					noThemes: true,
-				},
-			});
-			return {
-				...(await createAgentSessionFromServices({
-					services,
-					sessionManager,
-					sessionStartEvent,
-					model: faux.getModel(),
-				})),
-				services,
-				diagnostics: services.diagnostics,
-			};
-		};
-
-		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
+		const { runner } = await setupEmbeddedExtensions({
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+			factories: sess.extensionFactories,
 		});
-		await runtimeHost.session.bindExtensions({});
-		return { runtimeHost, sess };
+		const host = new PiHostLoop({
+			model: faux.getModel(),
+			getApiKey: () => "faux-key",
+			sessionId: sess.sessionId,
+			tools: sess.hostTools,
+			...bridgeAgentHooks(runner, { cwd: tempDir }),
+		});
+		return { host, sess };
 	}
 
-	function toolResultTexts(host: unknown): string[] {
-		const messages = (
-			host as {
-				session: { messages: Array<{ role: string; content?: Array<{ type: string; text?: string }> }> };
-			}
-		).session.messages;
-		return messages
+	function toolResultTexts(messages: readonly unknown[]): string[] {
+		return (messages as Array<{ role: string; content?: Array<{ type: string; text?: string }> }>)
 			.filter((m) => m.role === "toolResult")
 			.flatMap((m) => m.content ?? [])
 			.filter((c) => c.type === "text" && typeof c.text === "string")
@@ -94,7 +62,7 @@ describe("P5-20 fiat_job_apply 端到端", () => {
 	}
 
 	it("预建已审批工单 → fiat_job_apply 执行底层变更（applied），并写入审计", async () => {
-		const { runtimeHost, sess } = await setup();
+		const { host, sess } = await setup();
 
 		// 预建 + 审批（真实 L2 由 Lark 回调触发 approve）
 		const r = await sess.approval.requestApply({
@@ -114,21 +82,19 @@ describe("P5-20 fiat_job_apply 端到端", () => {
 			fauxAssistantMessage("done"),
 		]);
 
-		await runtimeHost.session.prompt("执行工单");
+		await host.runTurn("执行工单");
 
-		const texts = toolResultTexts(runtimeHost);
+		const texts = toolResultTexts(host.messages);
 		expect(texts.length).toBeGreaterThan(0);
 		const parsed = JSON.parse(texts[0] ?? "{}") as { ok: boolean };
 		expect(parsed.ok).toBe(true);
 
 		const entries = sess.auditClient.entries?.() ?? [];
 		expect(entries.some((e) => e.outcome === "applied")).toBe(true);
-
-		runtimeHost.dispose();
 	});
 
 	it("工单未审批就调 fiat_job_apply：返回 pending_approval，不执行", async () => {
-		const { runtimeHost, sess } = await setup();
+		const { host, sess } = await setup();
 
 		const r = await sess.approval.requestApply({
 			tool: "fiat_cashback_reconcile",
@@ -147,16 +113,14 @@ describe("P5-20 fiat_job_apply 端到端", () => {
 			fauxAssistantMessage("done"),
 		]);
 
-		await runtimeHost.session.prompt("执行工单");
+		await host.runTurn("执行工单");
 
-		const texts = toolResultTexts(runtimeHost);
+		const texts = toolResultTexts(host.messages);
 		const parsed = JSON.parse(texts[0] ?? "{}") as { ok: boolean; code?: string };
 		expect(parsed.ok).toBe(false);
 		expect(parsed.code).toBe("pending_approval");
 
 		const entries = sess.auditClient.entries?.() ?? [];
 		expect(entries.some((e) => e.outcome === "applied")).toBe(false);
-
-		runtimeHost.dispose();
 	});
 });

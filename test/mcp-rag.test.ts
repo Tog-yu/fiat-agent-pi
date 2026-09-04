@@ -1,22 +1,12 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall, getModel, registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-	AuthStorage,
-	type CreateAgentSessionRuntimeFactory,
-	createAgentSession,
-	createAgentSessionFromServices,
-	createAgentSessionRuntime,
-	createAgentSessionServices,
-	DefaultResourceLoader,
-	SessionManager,
-	SettingsManager,
-} from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setupEmbeddedExtensions } from "../src/server/host/extensions.ts";
 import { createMcpRagTools, type McpClientLike, type RagStatus } from "../src/server/host/l1b/mcp-rag.ts";
-import { hostToolsAsFactory } from "../src/server/host/tools.ts";
+import { PiHostLoop } from "../src/server/host/loop.ts";
 
 interface CapturedTool {
 	name: string;
@@ -78,131 +68,64 @@ describe("P1-5/P1-6/P1-7 mcp-rag 扩展", () => {
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
 
-		// 先挂好 notify 再建会话：bootstrap 在会话创建阶段就会触发 onStatus
+		// 先挂好 notify 再装配：createMcpRagTools 的 bootstrap 会触发 onStatus
 		const statusReady = new Promise<{ status: RagStatus; detail: string }>((resolve) => {
 			notify = (s, d) => resolve({ status: s, detail: d });
 		});
 
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({
-				cwd,
-				agentDir: tempDir,
-				authStorage,
-				resourceLoaderOptions: {
-					extensionFactories: [
-						hostToolsAsFactory(
-							await createMcpRagTools({
-								config: { transport: "stdio" },
-								clientFactory: () => client,
-								onStatus: (s, d) => notify?.(s, d),
-							}),
-						),
-					],
-					noSkills: true,
-					noPromptTemplates: true,
-					noThemes: true,
-				},
-			});
-			return {
-				...(await createAgentSessionFromServices({
-					services,
-					sessionManager,
-					sessionStartEvent,
-					model: faux.getModel(),
-				})),
-				services,
-				diagnostics: services.diagnostics,
-			};
-		};
-
-		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+		const tools = await createMcpRagTools({
+			config: { transport: "stdio" },
+			clientFactory: () => client,
+			onStatus: (s, d) => notify?.(s, d),
 		});
-		await runtimeHost.session.bindExtensions({});
+		await setupEmbeddedExtensions({ cwd: tempDir, agentDir: tempDir });
+		const host = new PiHostLoop({
+			model: faux.getModel(),
+			getApiKey: () => "faux-key",
+			tools,
+		});
 
 		// 等 bootstrap 注册完成再驱动会话
 		const status = await statusReady;
 		expect(status.status).toBe("ready");
 
-		await runtimeHost.session.prompt("查一下返现规则");
+		await host.runTurn("查一下返现规则");
 
 		// MCP callTool 收到的参数经 Type.Unsafe schema 校验后原样透传
 		expect(calls).toEqual([{ name: "query_knowledge_hub", arguments: { query: "返现规则" } }]);
 
 		// 工具结果回灌进会话
-		const toolResultText = runtimeHost.session.messages
+		const toolResultText = (host.messages as Array<{ role?: string; content?: Array<{ type: string; text?: string }> }>)
 			.filter((m) => m.role === "toolResult")
-			.flatMap((m) => m.content)
+			.flatMap((m) => m.content ?? [])
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("\n");
 		expect(toolResultText).toContain("RAG 答案：返现规则如下…");
 
-		runtimeHost.dispose();
 		faux.unregister();
 	});
 
 	it("② P1-7 connect 失败 → 降级：不注册工具，状态 unavailable", async () => {
-		let notify: ((s: RagStatus, d: string) => void) | undefined;
 		const statuses: Array<{ status: RagStatus; detail: string }> = [];
 
-		const settingsManager = SettingsManager.create(tempDir, agentDir);
-		const sessionManager = SessionManager.inMemory();
-		const statusReady = new Promise<void>((resolve) => {
-			notify = () => resolve();
+		const tools = await createMcpRagTools({
+			config: { transport: "stdio" },
+			clientFactory: () =>
+				mockClient({
+					connect: async () => {
+						throw new Error("ECONNREFUSED");
+					},
+				}),
+			onStatus: (s, d) => {
+				statuses.push({ status: s, detail: d });
+			},
 		});
-		const resourceLoader = new DefaultResourceLoader({
-			cwd: tempDir,
-			agentDir,
-			settingsManager,
-			extensionFactories: [
-				hostToolsAsFactory(
-					await createMcpRagTools({
-						config: { transport: "stdio" },
-						clientFactory: () =>
-							mockClient({
-								connect: async () => {
-									throw new Error("ECONNREFUSED");
-								},
-							}),
-						onStatus: (s, d) => {
-							statuses.push({ status: s, detail: d });
-							notify?.(s, d);
-						},
-					}),
-				),
-			],
-		});
-		await resourceLoader.reload();
-		const model = getModel("anthropic", "claude-sonnet-4-5");
-		expect(model).toBeDefined();
-		if (!model) throw new Error("test model unavailable");
-		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir,
-			model,
-			settingsManager,
-			sessionManager,
-			resourceLoader,
-		});
-		await session.bindExtensions({});
-		await statusReady;
 
 		expect(statuses[0]?.status).toBe("unavailable");
 		expect(statuses[0]?.detail).toContain("ECONNREFUSED");
-		expect(
-			session
-				.getAllTools()
-				.map((t) => t.name)
-				.filter((n) => n.startsWith("mcp_rag_")),
-		).toEqual([]);
-
-		session.dispose();
+		expect(tools.filter((t) => t.name.startsWith("mcp_rag_"))).toEqual([]);
 	});
 
 	it("③ P1-7 callTool isError 透传 + 超时抛可重试错误", async () => {

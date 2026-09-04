@@ -12,21 +12,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import {
-	AuthStorage,
-	type CreateAgentSessionRuntimeFactory,
-	createAgentSessionFromServices,
-	createAgentSessionRuntime,
-	createAgentSessionServices,
-	SessionManager,
-} from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { InMemoryAuditClient } from "../src/server/audit/client.ts";
 import { LocalFiatClient } from "../src/server/fiat-tools/client.ts";
+import { bridgeAgentHooks, setupEmbeddedExtensions } from "../src/server/host/extensions.ts";
 import { createAuditHook } from "../src/server/host/l1a/audit-hook.ts";
 import { createPermissionGate } from "../src/server/host/l1a/permission-gate.ts";
 import { createFiatTools } from "../src/server/host/l1b/fiat-tools.ts";
-import { hostToolsAsFactory } from "../src/server/host/tools.ts";
+import { PiHostLoop } from "../src/server/host/loop.ts";
 import { LocalPolicyClient } from "../src/server/policy/client.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
@@ -61,50 +54,27 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 			},
 		};
 
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
+		const factories = [
+			createPermissionGate({
+				policy: new LocalPolicyClient(POLICY_PATH),
+				user: { id: "u1", role },
+				environment,
+				sessionId: "sess-test",
+				audit,
+			}),
+			createAuditHook({ audit, user: { id: "u1", role }, environment, sessionId: "sess-test" }),
+		];
+		const tools = createFiatTools({ client: wrapped });
 
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({
-				cwd,
-				agentDir: tempDir,
-				authStorage,
-				resourceLoaderOptions: {
-					extensionFactories: [
-						createPermissionGate({
-							policy: new LocalPolicyClient(POLICY_PATH),
-							user: { id: "u1", role },
-							environment,
-							sessionId: "sess-test",
-							audit,
-						}),
-						hostToolsAsFactory(createFiatTools({ client: wrapped })),
-						createAuditHook({ audit, user: { id: "u1", role }, environment, sessionId: "sess-test" }),
-					],
-					noSkills: true,
-					noPromptTemplates: true,
-					noThemes: true,
-				},
-			});
-			return {
-				...(await createAgentSessionFromServices({
-					services,
-					sessionManager,
-					sessionStartEvent,
-					model: faux.getModel(),
-				})),
-				services,
-				diagnostics: services.diagnostics,
-			};
-		};
-
-		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+		const { runner } = await setupEmbeddedExtensions({ cwd: tempDir, agentDir: tempDir, factories });
+		const host = new PiHostLoop({
+			model: faux.getModel(),
+			getApiKey: () => "faux-key",
+			sessionId: "sess-test",
+			tools,
+			...bridgeAgentHooks(runner, { cwd: tempDir }),
 		});
-		await runtimeHost.session.bindExtensions({});
-		return { runtimeHost, calls, audit };
+		return { host, calls, audit };
 	}
 
 	it("ops 调 fiat_es_search_logs：放行执行，client 收到原样参数，审计 allowed", async () => {
@@ -114,9 +84,9 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const { runtimeHost, calls, audit } = await setup("ops", "dev");
+		const { host, calls, audit } = await setup("ops", "dev");
 
-		await runtimeHost.session.prompt("查一下 error 级告警");
+		await host.runTurn("查一下 error 级告警");
 
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.tool).toBe("fiat_es_search_logs");
@@ -125,8 +95,6 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 		expect(entries).toHaveLength(1);
 		expect(entries[0]?.outcome).toBe("allowed");
 		expect(entries[0]?.isError).toBe(false);
-
-		runtimeHost.dispose();
 	});
 
 	it("viewer 调 fiat_es_search_logs：gate ② 按角色拦截，审计 isError，client 未被调", async () => {
@@ -136,17 +104,15 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const { runtimeHost, calls, audit } = await setup("viewer", "dev");
+		const { host, calls, audit } = await setup("viewer", "dev");
 
-		await runtimeHost.session.prompt("查一下告警");
+		await host.runTurn("查一下告警");
 
 		expect(calls).toEqual([]);
 		const entries = audit.entries() ?? [];
 		expect(entries).toHaveLength(1);
 		expect(entries[0]?.isError).toBe(true);
 		expect(entries[0]?.detail).toContain("角色 viewer 无权");
-
-		runtimeHost.dispose();
 	});
 
 	it("fiat_test_env：prod 环境被 gate ② 按环境拦截（仅 DEV 可用）", async () => {
@@ -154,17 +120,15 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 			fauxAssistantMessage([fauxToolCall("fiat_test_env", { action: "reset_data" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("done"),
 		]);
-		const { runtimeHost, calls, audit } = await setup("ops", "prod");
+		const { host, calls, audit } = await setup("ops", "prod");
 
-		await runtimeHost.session.prompt("重置测试数据");
+		await host.runTurn("重置测试数据");
 
 		expect(calls).toEqual([]);
 		const entries = audit.entries() ?? [];
 		expect(entries).toHaveLength(1);
 		expect(entries[0]?.isError).toBe(true);
 		expect(entries[0]?.detail).toContain("环境 prod 不允许");
-
-		runtimeHost.dispose();
 	});
 
 	it("viewer 调 fiat_cashback_parse（L1）：放行，client 收到表格内容", async () => {
@@ -175,17 +139,15 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 			),
 			fauxAssistantMessage("done"),
 		]);
-		const { runtimeHost, calls, audit } = await setup("viewer", "dev");
+		const { host, calls, audit } = await setup("viewer", "dev");
 
-		await runtimeHost.session.prompt("解析这张返现表");
+		await host.runTurn("解析这张返现表");
 
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.tool).toBe("fiat_cashback_parse");
 		const entries = audit.entries() ?? [];
 		expect(entries).toHaveLength(1);
 		expect(entries[0]?.outcome).toBe("allowed");
-
-		runtimeHost.dispose();
 	});
 
 	it("ops 在 staging 调 fiat_cashback_reconcile（L4,需审批）：放行 dry-run，不改数据", async () => {
@@ -195,16 +157,14 @@ describe("P3-13/P3-14 fiat-tools + 三道闸门", () => {
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const { runtimeHost, calls, audit } = await setup("ops", "staging");
+		const { host, calls, audit } = await setup("ops", "staging");
 
-		await runtimeHost.session.prompt("对一下返现账");
+		await host.runTurn("对一下返现账");
 
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.tool).toBe("fiat_cashback_reconcile");
 		const entries = audit.entries() ?? [];
 		expect(entries).toHaveLength(1);
 		expect(entries[0]?.outcome).toBe("allowed");
-
-		runtimeHost.dispose();
 	});
 });

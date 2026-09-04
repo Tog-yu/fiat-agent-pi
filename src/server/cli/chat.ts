@@ -1,7 +1,7 @@
 /**
  * fiat chat —— pi-host 驱动的自研 CLI 入口（P9-49）。
  *
- * 「入口切换」的落点：`pi -e ./pi-extensions/index.ts`（扩展加载器路径）→ `fiat chat`
+ * 「入口切换」的落点：原扩展加载器入口 → `fiat chat`（内嵌循环路径）。
  * （内嵌循环路径）。宿主 = `PiHostLoop`（Agent 直驱），装配链与 P9-48 闸门测试完全同源：
  *
  *   FIAT_MODEL=provider/model → ModelRegistry 注册 provider → 解析 Model

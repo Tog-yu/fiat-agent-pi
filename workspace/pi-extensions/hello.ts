@@ -5,8 +5,8 @@
  * 同时也是「工厂注入」模式的范本：扩展本身不依赖任何具体平台客户端，
  * 由入口（index.ts / 测试 / Web 宿主）注入 deps，从而实现单测 / TUI / 服务三处共用一份代码。
  *
- * 加载方式：
- *   cd fiat-agent-pi/workspace && pi -e ./pi-extensions/index.ts
+ * 状态：本文件为【归档】快照（P9-49），不再经扩展加载器加载；
+ * 现入口为 `npm run cli` → `fiat chat`（pi-host 内嵌循环）。
  */
 
 import { Type } from "@earendil-works/pi-ai";
@@ -43,5 +43,5 @@ export function createHelloExtension(deps: HelloDeps) {
 	};
 }
 
-// 默认导出：供 `pi -e ./pi-extensions/hello.ts` 直接加载（注入 TUI 默认 deps）
+// 默认导出：归档快照，原供扩展加载器直接加载（注入 TUI 默认 deps）；现入口为 `fiat chat`。
 export default createHelloExtension({ greeting: "Fiat" });

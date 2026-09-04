@@ -12,20 +12,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import {
-	AuthStorage,
-	type CreateAgentSessionRuntimeFactory,
-	createAgentSessionFromServices,
-	createAgentSessionRuntime,
-	createAgentSessionServices,
-	SessionManager,
-} from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { InMemoryAuditClient } from "../src/server/audit/client.ts";
+import { bridgeAgentHooks, setupEmbeddedExtensions } from "../src/server/host/extensions.ts";
 import { createAuditHook } from "../src/server/host/l1a/audit-hook.ts";
 import { createPermissionGate } from "../src/server/host/l1a/permission-gate.ts";
 import { createMcpRagTools, type McpClientLike, type RagStatus } from "../src/server/host/l1b/mcp-rag.ts";
-import { hostToolsAsFactory } from "../src/server/host/tools.ts";
+import { PiHostLoop } from "../src/server/host/loop.ts";
 import { LocalPolicyClient } from "../src/server/policy/client.ts";
 
 const POLICY_PATH = fileURLToPath(new URL("../config/tool_policies.yaml", import.meta.url));
@@ -73,67 +66,44 @@ describe("P2-11/P2-12 audit-hook + 三道闸门联动", () => {
 			},
 		});
 
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
-
 		let notify: ((s: RagStatus, d: string) => void) | undefined;
 		const statusReady = new Promise<{ status: RagStatus; detail: string }>((resolve) => {
 			notify = (s, d) => resolve({ status: s, detail: d });
 		});
 
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({
-				cwd,
-				agentDir: tempDir,
-				authStorage,
-				resourceLoaderOptions: {
-					extensionFactories: [
-						createPermissionGate({
-							policy: new LocalPolicyClient(POLICY_PATH),
-							user: { id: "u1", role },
-							environment: "dev",
-							sessionId: "sess-test",
-							audit,
-						}),
-						hostToolsAsFactory(
-							await createMcpRagTools({
-								config: { transport: "stdio" },
-								clientFactory: () => client,
-								onStatus: (s, d) => notify?.(s, d),
-							}),
-						),
-						createAuditHook({
-							audit,
-							user: { id: "u1", role },
-							environment: "dev",
-							sessionId: "sess-test",
-						}),
-					],
-					noSkills: true,
-					noPromptTemplates: true,
-					noThemes: true,
-				},
-			});
-			return {
-				...(await createAgentSessionFromServices({
-					services,
-					sessionManager,
-					sessionStartEvent,
-					model: faux.getModel(),
-				})),
-				services,
-				diagnostics: services.diagnostics,
-			};
-		};
-
-		const runtimeHost = await createAgentSessionRuntime(createRuntime, {
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir),
+		const tools = await createMcpRagTools({
+			config: { transport: "stdio" },
+			clientFactory: () => client,
+			onStatus: (s, d) => notify?.(s, d),
 		});
-		await runtimeHost.session.bindExtensions({});
+
+		const factories = [
+			createPermissionGate({
+				policy: new LocalPolicyClient(POLICY_PATH),
+				user: { id: "u1", role },
+				environment: "dev",
+				sessionId: "sess-test",
+				audit,
+			}),
+			createAuditHook({
+				audit,
+				user: { id: "u1", role },
+				environment: "dev",
+				sessionId: "sess-test",
+			}),
+		];
+
+		const { runner } = await setupEmbeddedExtensions({ cwd: tempDir, agentDir: tempDir, factories });
+		const host = new PiHostLoop({
+			model: faux.getModel(),
+			getApiKey: () => "faux-key",
+			sessionId: "sess-test",
+			tools,
+			...bridgeAgentHooks(runner, { cwd: tempDir }),
+		});
+
 		const status = await statusReady;
-		return { runtimeHost, calls, audit, status };
+		return { host, calls, audit, status };
 	}
 
 	it("① viewer 在白名单：放行执行，审计记 allowed", async () => {
@@ -143,10 +113,10 @@ describe("P2-11/P2-12 audit-hook + 三道闸门联动", () => {
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const { runtimeHost, calls, audit, status } = await setup("viewer");
+		const { host, calls, audit, status } = await setup("viewer");
 		expect(status.status).toBe("ready");
 
-		await runtimeHost.session.prompt("查一下返现规则");
+		await host.runTurn("查一下返现规则");
 
 		expect(calls).toHaveLength(1);
 		const entries = audit.entries() ?? [];
@@ -154,8 +124,6 @@ describe("P2-11/P2-12 audit-hook + 三道闸门联动", () => {
 		expect(entries[0]?.tool).toBe("mcp_rag_query_knowledge_hub");
 		expect(entries[0]?.outcome).toBe("allowed");
 		expect(entries[0]?.isError).toBe(false);
-
-		runtimeHost.dispose();
 	});
 
 	it("② admin 不在白名单：gate ② block，审计记 isError + 拒绝原因", async () => {
@@ -165,10 +133,10 @@ describe("P2-11/P2-12 audit-hook + 三道闸门联动", () => {
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const { runtimeHost, calls, audit, status } = await setup("admin");
+		const { host, calls, audit, status } = await setup("admin");
 		expect(status.status).toBe("ready");
 
-		await runtimeHost.session.prompt("查一下返现规则");
+		await host.runTurn("查一下返现规则");
 
 		// 工具从未执行
 		expect(calls).toEqual([]);
@@ -177,7 +145,5 @@ describe("P2-11/P2-12 audit-hook + 三道闸门联动", () => {
 		expect(entries[0]?.tool).toBe("mcp_rag_query_knowledge_hub");
 		expect(entries[0]?.isError).toBe(true);
 		expect(entries[0]?.detail).toContain("角色 admin 无权");
-
-		runtimeHost.dispose();
 	});
 });

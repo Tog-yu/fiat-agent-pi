@@ -113,8 +113,7 @@ function makeDiagnose(policiesPath: string, sharedAudit: AuditClient) {
 		const { createDiagnosisRunner } = await import("../../../src/server/diagnosis/sessionRunner.ts");
 		const { buildSession } = await import("../../../src/server/session/factory.ts");
 
-		const authStorage = AuthStorage.inMemory();
-		const registry = ModelRegistry.inMemory(authStorage);
+		const registry = ModelRegistry.inMemory(AuthStorage.inMemory());
 		registry.registerProvider(provider, {
 			baseUrl: cfg.base_url,
 			apiKey: `$${cfg.api_key_env}`,
@@ -149,10 +148,14 @@ function makeDiagnose(policiesPath: string, sharedAudit: AuditClient) {
 					// 子会话把工具收敛到单个视角的只读子集（registered name → logical 归一后比对）
 					toolFilter: (registeredName) => task.tools.includes(policyToolName(registeredName)),
 				});
-				return { extensionFactories: r.extensionFactories, hostTools: r.hostTools, sessionId: r.sessionId };
+				return { extensionFactories: r.extensionFactories, tools: r.hostTools, sessionId: r.sessionId };
 			},
 			model,
-			authStorage,
+			getApiKey: (p) => {
+				const pcfg = p === provider ? cfg : modelPolicies.providers?.[p];
+				const envName = pcfg?.api_key_env ?? `${p.toUpperCase()}_API_KEY`;
+				return process.env[envName];
+			},
 			cwd: process.cwd(),
 			agentDir: getAgentDir(),
 		});

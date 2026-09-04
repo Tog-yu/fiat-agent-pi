@@ -9,8 +9,8 @@ PI_DIR="$ROOT/workspace/.pi"
 mkdir -p "$PI_DIR"
 
 # 技能放在仓库内，通过软链挂到 .pi 下，便于版本管理与 Review。
-# 扩展软链（extensions -> ../pi-extensions）为【归档】状态（P9-49）：pi -e 加载链路
-# 不再是受支持入口，仅保留历史快照对照；运行入口见 package.json 的 `npm run cli`。
+# 运行入口为自研 CLI（`npm run cli` → `fiat chat`，由 pi-host 内嵌循环驱动）；
+# 旧扩展加载器（目录自动发现）已弃用，原实现归档于 `workspace/pi-extensions/` 仅作对照。
 ln -sfn ../pi-skills "$PI_DIR/skills"
 
 echo "linked: $PI_DIR/skills -> ../pi-skills"

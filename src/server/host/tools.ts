@@ -2,7 +2,7 @@
  * P8-36 工具注册通道（L1b）：把工具**直接**注册进内嵌循环，替代扩展加载器。
  *
  * 设计口径（与阶段 8 铁律一致）：
- * - 阶段 8 弃用的是扩展加载器（目录自动发现 + `pi -e`），不是「工具」本身。
+ * - 阶段 8 弃用的是扩展加载器（目录自动发现），不是「工具」本身。
  *   4 个工具型扩展（mcp-rag / fiat-tools / job-apply / alert-fanout）在阶段 9 改写为
  *   **工具模块**：去掉 `ExtensionAPI` 依赖，直接暴露 `AgentTool`（正式契约 P9-40 定）。
  * - 本模块就是那条通道：`defineHostTool` 是工具模块的无 ExtensionAPI 落点（雏形契约），
@@ -17,7 +17,7 @@
  */
 
 import type { Agent, AgentTool } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
 /** pi-host 工具模块暴露的工具形状（去掉 ExtensionAPI 的 L1b 契约雏形，正式契约 P9-40） */
@@ -43,17 +43,6 @@ export function hostToolFromDefinition<TDetails = unknown>(
 		executionMode: definition.executionMode,
 		execute: (toolCallId, params, signal, onUpdate) =>
 			definition.execute(toolCallId, params, signal, onUpdate, undefined as never),
-	};
-}
-
-/**
- * 过渡兼容（P9-40~P9-49）：把 HostTool[] 包成 extension factory（`(pi) => void`），
- * 供仍走 `createAgentSession` 扩展注册路径的调用方（旧测试 / pi -e 遗留入口）使用。
- * 入口切换（P9-49）后内嵌循环直接消费 HostTool[]，此适配器可删。
- */
-export function hostToolsAsFactory(tools: readonly HostTool[]): (pi: ExtensionAPI) => void {
-	return (pi) => {
-		for (const tool of tools) pi.registerTool(tool);
 	};
 }
 

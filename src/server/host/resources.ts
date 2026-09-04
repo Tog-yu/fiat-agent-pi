@@ -2,7 +2,7 @@
  * P8-35 宿主资源层：把 `SettingsManager` + `DefaultResourceLoader` 当库接入 pi-host。
  *
  * 设计口径（与阶段 8 铁律一致）：
- * - 阶段 8 弃用的是**扩展加载器（目录自动发现 + `pi -e`）**，不是资源/设置这套库。
+ * - 阶段 8 弃用的是**扩展加载器（目录自动发现）**，不是资源/设置这套库。
  *   宿主仍需要「设置（模型选择等）」与「资源加载（系统提示词 / 内建 extension）」能力，
  *   只是加载方式从目录自动发现改为**编译期注入**。
  * - `DefaultResourceLoader` 显式传 `noExtensions / noSkills / noPromptTemplates / noThemes /

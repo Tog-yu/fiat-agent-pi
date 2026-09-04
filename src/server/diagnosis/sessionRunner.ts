@@ -1,9 +1,11 @@
 /**
- * P6-25 真实子会话 runner：每个诊断视角起一个**独立** AgentSession 并发跑。
+ * P6-25 真实子会话 runner：每个诊断视角起一个**独立**内嵌会话并发跑。
  *
- * 这是选「L2 进程内 fan-out」而不用 Pi 官方 subagent 扩展的关键兑现点：
+ * P10-50 扩展加载器清理：子会话从遗留 `createAgentSession`（SDK 扩展注册路径）切换到
+ * pi-host 内嵌循环（`PiHostLoop`，P8-34/37 装配链）—— 与 chat / 闸门测试完全同源：
  *   - 子会话由组合根用**同一个 buildSession** 构造 → 共享 subject 与三道闸门，
- *     审计落在同一条链上；子进程方案做不到（扩展是依赖注入工厂，磁盘加载等于没注册）
+ *     L1a 钩子经 setupEmbeddedExtensions + bridgeAgentHooks 生效（闸门②），
+ *     L1b 工具直接注册进循环（P8-36 通道），`hostToolsAsFactory` 过渡适配器随之删除
  *   - 会话用 inMemory：诊断子 agent 是一次性的取证过程，不需要落盘
  *   - 只读：可用工具由 DiagnosisTask.tools 收敛，由组合根经 toolFilter 生效
  *
@@ -12,85 +14,56 @@
  */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
-import {
-	type AuthStorage,
-	type CreateAgentSessionRuntimeFactory,
-	createAgentSessionFromServices,
-	createAgentSessionRuntime,
-	createAgentSessionServices,
-	type ExtensionAPI,
-	SessionManager,
-} from "@earendil-works/pi-coding-agent";
-import { hostToolsAsFactory } from "../host/tools.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { bridgeAgentHooks, setupEmbeddedExtensions } from "../host/extensions.ts";
+import { PiHostLoop } from "../host/loop.ts";
 import type { RunOne } from "./fanout.ts";
 import type { DiagnosisTask } from "./plan.ts";
 
 /** 子会话所需产出；SessionFactoryResult 结构上满足（避免 import factory 形成循环依赖） */
 export interface ChildSessionBundle {
-	extensionFactories: Array<(pi: ExtensionAPI) => void>;
 	sessionId: string;
-	/** P9-42：L1b 工具通道产物（过渡期经 hostToolsAsFactory 注册进遗留会话路径）；缺省无工具 */
-	hostTools?: import("../host/tools.ts").HostTool[];
+	/** P8-36 L1b 工具通道：直接注册进内嵌循环的工具集 */
+	tools?: import("../host/tools.ts").HostTool[];
+	/** P8-37 L1a 钩子通道：编译期注入的内建 extension 工厂（permission-gate / audit-hook / model-router） */
+	extensionFactories?: Array<(pi: ExtensionAPI) => void>;
 }
 
-/** 按视角构造子会话：视角的 tools 应在此收敛为只读子集（P9-42 起组合根 async，允许 Promise） */
+/** 按视角构造子会话：视角的 tools 应在此收敛为只读子集（组合根 async，允许 Promise） */
 export type BuildChildSession = (task: DiagnosisTask) => ChildSessionBundle | Promise<ChildSessionBundle>;
 
 export interface DiagnosisRunnerDeps {
 	buildChildSession: BuildChildSession;
 	model: Model<Api>;
-	authStorage: AuthStorage;
+	/** provider 名 → API key（faux 测试注入固定值；生产缺省读环境变量） */
+	getApiKey?: (provider: string) => string | undefined;
 	cwd: string;
 	agentDir: string;
-	/** 注入 provider 的 runtime key（faux 测试用；生产由 AuthStorage 自己解析 env） */
-	runtimeApiKey?: string;
 }
 
 export function createDiagnosisRunner(deps: DiagnosisRunnerDeps): RunOne {
 	return async (task: DiagnosisTask) => {
 		const bundle = await deps.buildChildSession(task);
-		if (deps.runtimeApiKey !== undefined) {
-			deps.authStorage.setRuntimeApiKey(deps.model.provider, deps.runtimeApiKey);
-		}
 
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({
-				cwd,
-				agentDir: deps.agentDir,
-				authStorage: deps.authStorage,
-				resourceLoaderOptions: {
-					extensionFactories: [
-						...bundle.extensionFactories,
-						...(bundle.hostTools ? [hostToolsAsFactory(bundle.hostTools)] : []),
-					],
-					noSkills: true,
-					noPromptTemplates: true,
-					noThemes: true,
-				},
-			});
-			return {
-				...(await createAgentSessionFromServices({
-					services,
-					sessionManager,
-					sessionStartEvent,
-					model: deps.model,
-				})),
-				services,
-				diagnostics: services.diagnostics,
-			};
-		};
-
-		const host = await createAgentSessionRuntime(createRuntime, {
+		const { runner } = await setupEmbeddedExtensions({
 			cwd: deps.cwd,
 			agentDir: deps.agentDir,
-			sessionManager: SessionManager.inMemory(),
+			factories: bundle.extensionFactories ?? [],
 		});
+
+		const host = new PiHostLoop({
+			model: deps.model,
+			getApiKey: deps.getApiKey,
+			sessionId: bundle.sessionId,
+			tools: bundle.tools ?? [],
+			...bridgeAgentHooks(runner),
+		});
+
 		try {
-			await host.session.bindExtensions({});
-			await host.session.prompt(task.prompt);
-			return extractFinalText(host.session.messages);
+			const r = await host.runTurnSafe(task.prompt);
+			return r.ok ? r.reply : `（视角执行失败：${r.error}）`;
 		} finally {
-			host.dispose();
+			// inMemory 会话随 Agent 释放；无持久化句柄需要显式 dispose
 		}
 	};
 }

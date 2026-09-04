@@ -58,7 +58,7 @@ export const HELP = `fiat —— 法币业务 CLI（pi-host 内嵌宿主驱动�
   fiat <command> [参数] [--flag value]
 
 命令:
-  chat [一句话]           内嵌会话问答（pi-host 驱动；P9-49 起替代 pi -e 入口）
+  chat [一句话]           内嵌会话问答（pi-host 驱动；P9-49 起替代原扩展加载器入口）
       无参数进入交互 REPL；带一句话则单轮执行后退出
       --session <path>    继续既有会话文件
   diagnose <告警标题>      并行告警诊断（多视角只读取证，输出聚合报告）

@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import { AuthStorage, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type FanoutSummary, runFanout } from "../src/server/diagnosis/fanout.ts";
 import {
@@ -335,12 +335,17 @@ describe("P6-25 端到端：createDiagnosisRunner 起真实子会话", () => {
 
 	it("子会话跑完单个视角并取回结论文本（走 buildSession，继承三道闸门）", async () => {
 		const runner = createDiagnosisRunner({
-			// 子会话由同一个 buildSession 构造 → 共享 subject 与三道闸门
-			buildChildSession: async () =>
-				await buildSession({ user: { id: "u1", role: "ops" }, environment: "dev" }, { policiesPath: POLICY_PATH }),
+			// 子会话由同一个 buildSession 构造 → 共享 subject 与三道闸门；
+			// 按 ChildSessionBundle 契约映射 hostTools → tools（与 entry.ts 一致）
+			buildChildSession: async () => {
+				const r = await buildSession(
+					{ user: { id: "u1", role: "ops" }, environment: "dev" },
+					{ policiesPath: POLICY_PATH },
+				);
+				return { extensionFactories: r.extensionFactories, tools: r.hostTools, sessionId: r.sessionId };
+			},
 			model: faux.getModel(),
-			authStorage: AuthStorage.inMemory(),
-			runtimeApiKey: "faux-key",
+			getApiKey: () => "faux-key",
 			cwd: tempDir,
 			agentDir: tempDir,
 		});

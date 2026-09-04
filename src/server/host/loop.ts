@@ -74,6 +74,12 @@ export interface HostLoopOptions {
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	/**
+	 * 每轮开始前钩子（L1a / P10-50 桥接点，model-router 用）。
+	 * 由 `bridgeAgentHooks(runner).beforeAgentStart` 产出——每轮 `runTurn` 前触发
+	 * `before_agent_start` 事件，路由决策经 `pi.setModel` 副作用生效。
+	 */
+	beforeAgentStart?: (prompt: string) => Promise<void>;
+	/**
 	 * 消息去重·清洗（P8-38）。传入则挂 Agent `transformContext`——每轮 LLM 调用前
 	 * 跑 `sanitizeMessages`（丢弃空消息 / 连续重复去重 / 按选项剥图·剥 thinking）。
 	 * 不改 transcript 本体，只清洗发给 LLM 的视图。
@@ -116,10 +122,12 @@ export class PiHostLoop {
 	readonly agent: Agent;
 	private readonly resolveKey: ApiKeyResolver;
 	private readonly hostSession?: HostSession;
+	private readonly beforeAgentStart?: (prompt: string) => Promise<void>;
 
 	constructor(opts: HostLoopOptions) {
 		this.resolveKey = opts.getApiKey ?? ((p) => process.env[`${p.toUpperCase()}_API_KEY`]);
 		this.hostSession = opts.session;
+		this.beforeAgentStart = opts.beforeAgentStart;
 
 		// streamFn：把当前 model 与透传的 options 交给 streamSimple，并补上 apiKey。
 		// Agent 在每轮调用时把 state.model 作为第一个参数传入，因此这里拿到的就是当前模型。
@@ -162,6 +170,9 @@ export class PiHostLoop {
 
 	/** 跑一轮：把 userText 作为 user 消息发起，返回最后一条 assistant 文本 */
 	async runTurn(userText: string): Promise<string> {
+		// model-router 桥接点（P10-50）：每轮开始前触发 before_agent_start，
+		// 路由决策经 pi.setModel 改写 state.model，本轮 LLM 调用即用新模型。
+		await this.beforeAgentStart?.(userText);
 		await this.agent.prompt(userText);
 		const all = this.agent.state.messages;
 		// 每轮把 agent 新增的消息增量落盘（线性追加语义）。
