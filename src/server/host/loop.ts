@@ -7,8 +7,9 @@
  *   `Agent` + `streamSimple` 驱动单轮，是 pi-embedded 的等价最小骨架。
  * - `streamFn` 由调用方注入（真实 provider 或 faux），auth 经 `getApiKey` 解析后透传给
  *   `streamSimple` 的 `apiKey`（Pi 的 `StreamOptions.apiKey`）。
- * - 工具通道（L1b / P8-36）与钩子通道（L1a / P8-37）后续挂载：本模块预留 `tools` 注入点
- *   （写 `agent.state.tools`），最小循环先不挂任何工具。
+ * - 工具通道（L1b / P8-36）：`tools` 经 `registerTools` 写 `agent.state.tools`，模型当轮
+ *   可见、由 Agent 循环本地执行；钩子通道（L1a / P8-37）后续经 Agent options 的
+ *   `beforeToolCall` / `extensionFactories` 挂载。
  * - 会话基础设施（P8-35）：传入 `session: HostSession` 则构造时恢复历史 transcript
  *   （`session.messages()`）、每轮 `runTurn` 后把增量 `syncDelta` 落盘；传入 `resources:
  *   HostResources` 则系统提示词优先取 `resources.systemPrompt`。两者均取自 `pi-coding-agent`
@@ -22,6 +23,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { HostResources } from "./resources.ts";
 import type { HostSession } from "./session.ts";
+import { type HostTool, registerTools } from "./tools.ts";
 
 /** provider 名 → API key；缺省读 `process.env[${PROVIDER}_API_KEY]` */
 export type ApiKeyResolver = (provider: string) => string | undefined;
@@ -36,10 +38,11 @@ export interface HostLoopOptions {
 	/** 会话 ID（审计 / 可观测） */
 	sessionId?: string;
 	/**
-	 * 工具集（L1b / P8-36 挂载点）。最小循环可留空；
-	 * 赋值即写 `agent.state.tools`，模型当轮可见。
+	 * 工具集（L1b / P8-36 通道）。可留空；
+	 * 经 `registerTools` 写 `agent.state.tools`，模型当轮可见、由 Agent 循环本地执行。
+	 * 拦截/审计不在此处——闸门② 走 L1a（P8-37），canExecute 在 L2。
 	 */
-	tools?: Array<unknown>;
+	tools?: HostTool[];
 	/**
 	 * 会话句柄（P8-35）。传入则：构造时用 `session.messages()` 恢复历史 transcript，
 	 * 每轮 `runTurn` 后把新增消息 `syncDelta` 落盘。不传则为纯内存会话。
@@ -111,7 +114,7 @@ export class PiHostLoop {
 			},
 		});
 
-		if (opts.tools) this.agent.state.tools = opts.tools as never;
+		if (opts.tools) registerTools(this.agent, opts.tools);
 	}
 
 	/** 跑一轮：把 userText 作为 user 消息发起，返回最后一条 assistant 文本 */
