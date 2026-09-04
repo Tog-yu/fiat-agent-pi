@@ -18,6 +18,12 @@
  * 运行：`Agent` 是有状态包装；`prompt(text)` 跑完一轮，`state.messages` 取回复。
  */
 
+import type {
+	AfterToolCallContext,
+	AfterToolCallResult,
+	BeforeToolCallContext,
+	BeforeToolCallResult,
+} from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
@@ -54,6 +60,17 @@ export interface HostLoopOptions {
 	 * 留待宿主层；`resources.model` getter 为后续预留。）
 	 */
 	resources?: HostResources;
+	/**
+	 * 工具调用前钩子（L1a / P8-37 桥接点，承载闸门②）。
+	 * 由 `bridgeAgentHooks(runner).beforeToolCall` 产出——extension `tool_call` 钩子的
+	 * `{block, reason}` 与此返回形状一致，直通。
+	 */
+	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+	/**
+	 * 工具结果钩子（L1a / P8-37 桥接点，audit-hook 用）。
+	 * 由 `bridgeAgentHooks(runner).afterToolCall` 产出。
+	 */
+	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 }
 
 /** 取最后一条 assistant 消息的文本作为该轮回复 */
@@ -112,6 +129,9 @@ export class PiHostLoop {
 				systemPrompt,
 				messages: initialMessages,
 			},
+			// L1a 钩子桥接点（P8-37）：由 bridgeAgentHooks(runner) 产出后透传。
+			beforeToolCall: opts.beforeToolCall,
+			afterToolCall: opts.afterToolCall,
 		});
 
 		if (opts.tools) registerTools(this.agent, opts.tools);
