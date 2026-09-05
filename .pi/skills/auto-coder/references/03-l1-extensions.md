@@ -16,15 +16,12 @@
 
 **分流原则**：挂了 `pi.on(...)` 且零工具定义的 → 保留为内建 extension（L1a）；只 `registerTool` 且零事件的 → 改写为工具模块（L1b）。理由见 §2.5「关键修正·二次」——钩子依赖 Pi agent-loop 的既有语义（如 `tool_call` 的 `{ block: true, reason }` 短路回灌），宿主层自研要重造，代价远高于复用。
 
-**签名约定**：Pi 扩展签名固定为 `(pi) => void`，不接收参数；但扩展需要 platform / policy / audit client。统一写成**工厂的工厂**：
+**两套契约（P9-40 定）**：
 
-```ts
-export function createFiatTools(deps: FiatDeps) {
-  return (pi: ExtensionAPI) => { /* 注册工具 */ };
-}
-```
+- **L1a 内建 extension**（钩子型：permission-gate / audit-hook / model-router）：保留 Pi `ExtensionFactory` 签名 `(pi) => void`，经 `extensionFactories` **编译期注入**（不再走目录发现 / `pi -e`）；钩子用 `pi.on("tool_call" | "tool_result" | "before_agent_start", ...)` 实现拦截 / 审计 / 模型路由。
+- **L1b 工具模块**（工具型：mcp-rag / fiat-tools / job-apply / alert-fanout）：**去掉 `ExtensionAPI` 依赖**，工厂直接返回 `HostTool[]`（如 `createFiatTools(deps): HostTool[]`），由宿主经 `registerTools` 直接注册进内嵌循环。
 
-Web 场景注入进程内直连 client（零网络），TUI 场景注入 HTTP client，测试注入 mock。
+两类工厂均为「工厂的工厂」：`createXxx(deps)` 返回 `(pi) => void` 或 `HostTool[]`，client 由入口注入——Web 场景注入进程内直连 client（零网络），TUI 场景注入 HTTP client，测试注入 mock。
 
 **工具 schema 是 TypeBox，不是 Pydantic。** 工具集按风险分级，ops 角色看不到 `fiat_job_apply`。
 
@@ -32,7 +29,7 @@ Web 场景注入进程内直连 client（零网络），TUI 场景注入 HTTP cl
 
 | 闸门 | 时机 | 说明 |
 |---|---|---|
-| ① 会话级工具裁剪 | `createAgentSession({ tools })` | 模型根本看不到 |
+| ① 会话级工具裁剪 | `buildSession(subject, { toolFilter })`（内嵌循环，等价原 `createAgentSession({ tools })`） | 模型根本看不到 |
 | ② `tool_call` block | 调用前 | **回灌 isError 文本，模型可能重试，只是第一道** |
 | ③ 服务端 `canExecute` | 执行前最后一查 | **唯一权威** |
 

@@ -15,10 +15,8 @@ fiat-agent/
     AGENTS.md                   # 业务规则 / 术语 / 环境说明（Pi 自动注入上下文）
     .pi/
       settings.json
-      extensions -> ../pi-extensions
-      skills     -> ../pi-skills
-    pi-extensions/
-    pi-skills/
+      skills     -> ../pi-skills          # 仅保留 skills 软链（P9-49 起 extensions 软链归档）
+    pi-skills/                                # 原 pi-extensions 归档于 workspace/pi-extensions/（只读快照，不随 L1 演进）
   src/server/                   # L2 Fastify 平台服务
   docs/
 ```
