@@ -111,5 +111,50 @@
 - [x] P10-52 评估是否进一步**内化** `agent-core`（对标 OpenClaw v2026.5.28 的做法），作为长期选项单独立项
   - 结论：不立即内化，单独立项为长期 backlog（详见 `docs/P10-52-internalize-agent-core.md`）。**口径更正**：OpenClaw 自身也用 registry 钉版本黑盒、并不 vendor Pi 源码，故「对标 OpenClaw」实为反对内化的论据；当前三道闸门已走 `extensionFactories`、无 loop-kernel 级 patch 硬需求。
 
+### 阶段 11：三层评测（结果 / 轨迹 / 单步）
+
+验收：CI 内 faux 驱动跑通「结果 + 轨迹（部分分）+ 单步」三维度评分与 pass 判定；在线采集（eval-recorder → sink）链路就绪；评测链路**只读不拦**，不触碰三道闸门语义。
+设计依据：Obsidian `agent问题笔记/fiat-agent-pi-三层评测设计方案.md`（采集边界 / 三种轨迹匹配模式 / 表结构 / 与闸门边界）。
+
+**核心设计（一句话版）**：
+- pi 无 eval 层，原料齐全（JSONL 树轨迹 / 事件流 / faux provider），判定逻辑自建。
+- 三层评测：**结果层**（outcome，确定性判定为主，一票否决）、**轨迹层**（trajectory，LCP 前缀 + 路标子序列 + 硬约束，给部分分）、**单步层**（first_step，首工具命中，`any_of` 多解）。
+- 采集：L1a 扩展 `eval-recorder`（挂在闸门之后，只读不拦）；判定：纯逻辑包 `src/server/eval/`（零 Pi 依赖）；存储：三张表（run / step / score），**与 `fiat_audit_log` 分离**（审计是合规事实，评测是可重算实验数据）。
+- 期望序列不写死完整顺序：`milestones`（路标，2~4 个必经点）+ `first_step.any_of`（多解）+ `forbid`（硬约束，出现即 0）+ `max_steps`。
+- LLM 在评测链只有两个合法位置：冷启动生成 case（产出进 case 不进评分链路）、rubric 判定主观维度（低权重、可关）。明确禁止「跑完让 LLM 看轨迹打分」。
+
+**⚠️ 采集口径更正（2026-09-06，对照 0.80.3 源码实测）**：设计方案 §2 原设想 `tool_call`/`tool_result` 钩子采集每步。实测 `ExtensionRunner.emitToolCall` **对被 block 的调用短路返回**（runner.js:639-657），且被 block 不产生 `tool_result`（P8-39 已实测）→ eval-recorder 若排在 factories 尾部，收不到被闸门②拦截调用的 `tool_call`。**修正采集面**：改用 `turn_start` / `turn_end` / `agent_end` 三个生命周期事件——`turn_end` 携带本轮完整 `toolResults`（含 isError 回灌结果，被 block 的调用也在其中，天然含 `blocked` 信号）；`agent_end` 携带完整 messages（outcome 判定输入）。这样 eval-recorder 不再依赖 `tool_call`/`tool_result` 顺序，与 audit-hook（tool_result 面采集）职责正交：**audit 记「每次调用」，eval 记「每轮轨迹」**。
+
+**与三道闸门的边界（硬约束，来自设计方案 §6）**：
+1. eval-recorder 挂在闸门之后，只订阅不改写、不返回 block——评测永远不能影响执行。
+2. 评测不绕过审批：高风险 case 期望 `ticket_created` 终态 + 后续 `fiat_job_apply`，而不是直接执行成功。
+3. 评测数据 `input` 脱敏：沿用审计红线，只存参数键与必要值，不落 prompt 全文 / 业务敏感字段。
+4. 子会话（P6-25）recorder 传 `parentRunId`，否则多体轨迹散成孤儿 run。
+5. CI 里跑真实 `tool_policies.yaml`，绝不放宽——「为了让评测通过而放宽权限」是最容易的作弊路径。
+
+**打分公式（设计方案 §9.3，替代纯 LCP 版本）**：
+
+```text
+constraint 违反（forbid 命中 / 必须项缺失 / 超 max_steps）→ trajectory = 0
+否则 trajectory = 0.6 × milestone_coverage
+                + 0.4 × prefix_coverage（未配置 strict prefix 时该权重并入 milestone）
+                − 0.10 × blocked_n
+                − 0.02 × max(0, steps − max_steps)
+final_score = Σ(value_i × weight_i) / Σ(weight_i)
+passed      = final_score ≥ case.threshold 且 outcome 维度必须 = 1（结果维度一票否决）
+first_step  = 1 if 实际首工具 ∈ any_of else 0
+```
+
+- [x] P11-53 **eval 纯逻辑 types + outcome grader**：`src/server/eval/types.ts`（`EvalCase` / `RunTrace` / `StepRecord` / `Score` / `TrajectoryExpectation`）+ `src/server/eval/outcome.ts`（终态判定 `terminalOf`：`answered` / `ticket_created` / `applied`；`requiresApproval` 校验必须出现 `fiat_job_apply`；`stopReason error/aborted` → 0 分）
+- [x] P11-54 **轨迹打分**：`src/server/eval/trajectory.ts`——LCP 前缀匹配（部分分来源）、路标子序列相对顺序校验、forbid/max_steps 硬约束、blocked/超步惩罚、按上方公式合成
+- [x] P11-55 **单步打分 + 汇总**：`src/server/eval/first-step.ts`（`any_of` 首工具命中）+ `src/server/eval/aggregate.ts`（加权汇总 + `passed` 判定：outcome 一票否决）
+- [x] P11-56 **case 配置加载**：`config/eval_cases.yaml`（首个 case：alert-diagnose-prod，含 terminal / requires_approval / first_step.any_of / milestones / forbid / max_steps / threshold）+ `src/server/eval/cases.ts` 加载与校验（缺 terminal / threshold 的 case 拒绝加载）
+- [x] P11-57 **InMemoryEvalSink**：`src/server/eval/sink.ts`——`EvalSink` 接口（`writeRun`）+ `InMemoryEvalSink`（零依赖，测试断言用）；run / step / score 结构与设计方案 §3 三张表字段一一对应
+- [x] P11-58 **eval-recorder L1a 扩展**：`src/server/host/l1a/eval-recorder.ts`——订阅 `turn_start` / `turn_end` / `agent_end`，从 `turn_end.toolResults` 提取 step（tool / isError / blocked 推断 / durationMs），`agent_end` 时组装 `RunTrace` 写 sink；factory 尾部追加进 `buildSession` 的 factories（不插队，位置契约：`[gate, audit, modelRouter, ...evalRecorder?]`）；`SessionFactoryOptions` 加可选 `evalSink?: EvalSink` + `parentRunId?: string`，**缺省不注册（fail-safe，现有测试零改动）**
+- [x] P11-59 **宿主事件扇出补齐**：`src/server/host/loop.ts` / `extensions.ts`——`PiHostLoop` 订阅 `Agent.subscribe()`，把 `turn_start` / `turn_end` / `agent_end` 经 `runner.emit(...)` 扇出给 extension 钩子（P8-38 遗留职责，eval-recorder 的前置）；不改 Pi 核心
+- [x] P11-60 **三层评测集成测试**：`test/eval-outcome.test.ts` / `test/eval-trajectory.test.ts` / `test/eval-first-step.test.ts`（纯逻辑直接断言）+ `test/eval-recorder.test.ts`（faux provider 驱动完整会话：闸门② block 场景 → step.blocked=true；正常场景 → 全链路 score 落 InMemoryEvalSink、pass 判定生效）
+- [x] P11-61 **CI case 闭环**：跑真实 `config/tool_policies.yaml`（不放宽）+ stub Lark/Fiat client，`cashback-reconcile-approval` case 全链路出分 ≥ threshold（含 viewer 越权场景：gate ①裁剪后猜名调用 → not found 记 blocked + outcome 一票否决）；同步 `npm run check` 全绿
+  - ⚠️ 验收注记（2026-09-07）：「全量 vitest 全绿」达成 **196/199**——3 个失败（`cli-chat.test.ts` ×2、`host-duties.test.ts` ×1）为 **5s 超时**，经 git worktree 干净基线（HEAD `6d685a5`，移除本阶段全部改动后重跑同组测试）复现同样 3 失败，确认是**既有环境问题**（vitest forks worker 在本机负载下的启动/执行超时），与阶段 11 改动无关。全量跑时 vitest worker 报 `Failed to start forks worker ... Timeout waiting for worker to respond`；单独分批重跑这些文件时部分可过，属 flaky。后续可作为独立任务（调 `testTimeout` / 改 `pool: "threads"`）处理，不阻塞本阶段。
+
 ---
 

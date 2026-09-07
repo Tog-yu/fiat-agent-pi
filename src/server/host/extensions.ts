@@ -134,6 +134,10 @@ export async function setupEmbeddedExtensions(opts: EmbeddedExtensionsOptions): 
  * `beforeAgentStart` 单独透出（model-router 的 `before_agent_start` 桥接点，P10-50 起
  * 内嵌循环也触发模型路由；Agent 无同名 options，由宿主在每轮 prompt 前调用）。
  * 返回值直接可展开进 `new Agent({...})` / `HostLoopOptions`。
+ *
+ * 阶段 11（P11-59）：`turn_start` / `turn_end` / `agent_end` 走 `Agent.subscribe()` +
+ * `runner.emit(...)` 扇出（见 `bridgeLifecycleEvents`）——0.80.3 通用 emit 不短路、
+ * 逐扩展触发（runner.js:522-554），eval-recorder 的采集依赖这三个事件。
  */
 export function bridgeAgentHooks(
 	runner: ExtensionRunner,
@@ -175,6 +179,43 @@ export function bridgeAgentHooks(
 			await runner.emitBeforeAgentStart(prompt, undefined, "", { cwd: opts.cwd });
 		},
 	};
+}
+
+/**
+ * 阶段 11（P11-59）：生命周期事件扇出——把 `Agent.subscribe()` 收到的
+ * `turn_start` / `turn_end` / `agent_end` 经 `runner.emit(...)` 转发给 extension 钩子。
+ *
+ * - 通用 `emit` 对这三类事件不短路、逐扩展触发（0.80.3 runner.js:522-554 实测），
+ *   eval-recorder 依赖该语义做轨迹采集。
+ * - ⚠️ 形状差异（0.80.3 实测）：agent-core 的 `AgentEvent.turn_start` / `turn_end`
+ *   **不带 turnIndex**（agent-core types.d.ts:360-398），而 extension 侧的
+ *   `TurnStartEvent` / `TurnEndEvent` 要求 `turnIndex`（extensions/types.d.ts:526-537）。
+ *   → 宿主自持轮次计数器补齐（每次 turn_start 递增；单 session 内单调，与评测口径一致）。
+ * - 扇出错误经 runner 的 error listener 吞掉（emit 内部 emitError），不影响主循环——
+ *   与「评测只读不拦」的硬约束一致。
+ *
+ * 返回 unsubscribe 函数（测试清理用）。
+ */
+export function bridgeLifecycleEvents(
+	agent: import("@earendil-works/pi-agent-core").Agent,
+	runner: ExtensionRunner,
+): () => void {
+	let turnIndex = 0;
+	return agent.subscribe(async (event) => {
+		if (event.type === "turn_start") {
+			turnIndex += 1;
+			await runner.emit({ type: "turn_start", turnIndex, timestamp: Date.now() });
+		} else if (event.type === "turn_end") {
+			await runner.emit({
+				type: "turn_end",
+				turnIndex,
+				message: event.message,
+				toolResults: event.toolResults,
+			});
+		} else if (event.type === "agent_end") {
+			await runner.emit({ type: "agent_end", messages: event.messages });
+		}
+	});
 }
 
 export type { ExtensionFactory };

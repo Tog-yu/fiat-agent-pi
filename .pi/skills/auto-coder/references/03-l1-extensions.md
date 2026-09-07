@@ -7,6 +7,7 @@
 | `permission-gate` | 工具调用拦截 + collection 覆写 | `tool_call` | — | **钩子型** → L1a 内建 extension | P0 |
 | `audit-hook` | 把轨迹推给 L2 Audit | `tool_result` | — | **钩子型** → L1a | P1 |
 | `model-router` | 按任务类型选模型 | `before_agent_start` | — | **钩子型** → L1a | P1 |
+| `eval-recorder` | 三层评测采集（阶段 11） | `turn_start` / `turn_end` / `agent_end` | — | **钩子型** → L1a | P1（阶段 11） |
 | `mcp-rag` | MCP client 桥 | — | `mcp_rag.*` | **工具型** → L1b 工具模块 | P0 |
 | `fiat-tools` | 业务工具集 | — | `fiat_cashback_reconcile` | **工具型** → L1b | P0 |
 | `job-apply` | 执行已审批工单（P5-20） | — | `fiat_job_apply` | **工具型** → L1b | P0 |
@@ -18,7 +19,7 @@
 
 **两套契约（P9-40 定）**：
 
-- **L1a 内建 extension**（钩子型：permission-gate / audit-hook / model-router）：保留 Pi `ExtensionFactory` 签名 `(pi) => void`，经 `extensionFactories` **编译期注入**（不再走目录发现 / `pi -e`）；钩子用 `pi.on("tool_call" | "tool_result" | "before_agent_start", ...)` 实现拦截 / 审计 / 模型路由。
+- **L1a 内建 extension**（钩子型：permission-gate / audit-hook / model-router / eval-recorder）：保留 Pi `ExtensionFactory` 签名 `(pi) => void`，经 `extensionFactories` **编译期注入**（不再走目录发现 / `pi -e`）；钩子用 `pi.on("tool_call" | "tool_result" | "before_agent_start" | "turn_start" | "turn_end" | "agent_end", ...)` 实现拦截 / 审计 / 模型路由 / 评测采集。
 - **L1b 工具模块**（工具型：mcp-rag / fiat-tools / job-apply / alert-fanout）：**去掉 `ExtensionAPI` 依赖**，工厂直接返回 `HostTool[]`（如 `createFiatTools(deps): HostTool[]`），由宿主经 `registerTools` 直接注册进内嵌循环。
 
 两类工厂均为「工厂的工厂」：`createXxx(deps)` 返回 `(pi) => void` 或 `HostTool[]`，client 由入口注入——Web 场景注入进程内直连 client（零网络），TUI 场景注入 HTTP client，测试注入 mock。

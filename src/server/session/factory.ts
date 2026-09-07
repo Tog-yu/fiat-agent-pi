@@ -24,8 +24,11 @@ import { type FiatToolClient, LocalFiatClient } from "../../../src/server/fiat-t
 import { type AuditClient, InMemoryAuditClient } from "../audit/client.ts";
 import type { RunOne, TaskOutcome } from "../diagnosis/fanout.ts";
 import type { DiagnosisAngle } from "../diagnosis/plan.ts";
+import type { EvalSink } from "../eval/sink.ts";
+import type { EvalCase } from "../eval/types.ts";
 import { defineHostTools, type HostTool } from "../host/contracts.ts";
 import { createAuditHook } from "../host/l1a/audit-hook.ts";
+import { createEvalRecorder } from "../host/l1a/eval-recorder.ts";
 import { createModelRouter, type ModelResolver, type RouteApplied } from "../host/l1a/model-router.ts";
 import { createPermissionGate } from "../host/l1a/permission-gate.ts";
 import { createAlertFanout } from "../host/l1b/alert-fanout.ts";
@@ -84,6 +87,12 @@ export interface SessionFactoryOptions {
 	diagnosisConcurrency?: number;
 	diagnosisTimeoutMs?: number;
 	onDiagnosisTask?: (outcome: TaskOutcome) => void;
+	/** 阶段 11：评测 sink。**缺省不注册 eval-recorder（fail-safe，现有测试零改动）** */
+	evalSink?: EvalSink;
+	/** 阶段 11：CI 场景的评测 case（提供则 recorder 算分；在线采集为空） */
+	evalCase?: EvalCase;
+	/** 阶段 11：P6-25 子会话挂父 run（多体轨迹关联） */
+	parentRunId?: string;
 }
 
 export interface SessionFactoryResult {
@@ -190,7 +199,21 @@ export async function buildSession(
 	});
 
 	// P9-40 分流装配：L1a 钩子通道（编译期注入）；L1b 工具通道（直接注册进循环）
+	// 阶段 11：eval-recorder **尾部追加，不插队**（位置契约：[gate, audit, modelRouter, ...evalRecorder?]）。
+	// 缺省 fail-safe：没传 evalSink 就不注册。
 	const factories: Array<(pi: ExtensionAPI) => void> = [gate, audit, modelRouter];
+	if (opts.evalSink) {
+		factories.push(
+			createEvalRecorder({
+				sink: opts.evalSink,
+				user: subject.user,
+				environment: subject.environment,
+				sessionId,
+				...(opts.evalCase ? { evalCase: opts.evalCase } : {}),
+				...(opts.parentRunId ? { parentRunId: opts.parentRunId } : {}),
+			}),
+		);
+	}
 	const hostTools = defineHostTools([...mcpRagTools, ...fiatTools, ...jobApply]);
 	if (opts.diagnosisRunner) {
 		hostTools.push(

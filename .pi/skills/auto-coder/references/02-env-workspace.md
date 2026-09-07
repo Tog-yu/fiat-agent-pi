@@ -123,6 +123,7 @@ L2  Fiat Platform    Fastify: Auth/RBAC · Approval · Audit · Workflow · PG
 L1a Fiat Hooks       ← 【更正】保留为「内建 extension」，走 extensionFactories
                         permission-gate(tool_call) · audit-hook(tool_result)
                         · model-router(before_agent_start)
+                        · eval-recorder(turn_start/turn_end/agent_end, 阶段 11)
 L1b Fiat Tools       ← 改写为「工具模块」，直接注册进内嵌循环
                         mcp-rag · fiat-tools · job-apply · alert-fanout
 L0  Pi Runtime       复用（黑盒，不改）：

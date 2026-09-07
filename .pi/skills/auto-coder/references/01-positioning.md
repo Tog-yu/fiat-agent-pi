@@ -6,7 +6,8 @@
 
 ```text
 L2  Fiat Platform      自研：Auth/RBAC · Approval · Audit · Workflow · PG · Fastify
-L1  Fiat Extension     自研：3 内建 extension（permission-gate · audit-hook · model-router）+ 4 工具模块（mcp-rag · fiat-tools · job-apply · alert-fanout）
+L1  Fiat Extension     自研：4 内建 extension（permission-gate · audit-hook · model-router · eval-recorder）
+                            + 4 工具模块（mcp-rag · fiat-tools · job-apply · alert-fanout）
 L0  Pi Runtime         复用：agent-loop · context · compaction · session tree · 4 种模式
 ```
 
