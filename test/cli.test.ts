@@ -5,12 +5,19 @@
  * 验证「CLI 不含业务逻辑、与 L2 同源」—— 权限/审计/审批走的都是注入的同一批能力。
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalTicketRecord } from "../src/server/approval/ticket.ts";
 import type { AuditRecord } from "../src/server/audit/client.ts";
 import { intFlag, parseArgs } from "../src/server/cli/args.ts";
 import { allowedTools, HELP, renderTools } from "../src/server/cli/commands.ts";
 import { type CliDeps, type DiagnosisInput, runCli } from "../src/server/cli/index.ts";
+import { createSkillOps, type SkillOps } from "../src/server/cli/skills.ts";
+import { InMemoryProposalStore } from "../src/server/evolution/proposalStore.ts";
+import { SkillStore } from "../src/server/evolution/skillStore.ts";
+import { DEFAULT_EVOLUTION_CONFIG } from "../src/server/evolution/types.ts";
 
 function makeDeps(overrides: Partial<CliDeps> = {}): CliDeps {
 	const policies = new Map<
@@ -230,5 +237,93 @@ describe("runCli diagnose", () => {
 		const { io, err } = capture();
 		expect(await runCli(["diagnose", "x"], makeDeps({ diagnose }), io)).toBe(1);
 		expect(err.join("\n")).toContain("model down");
+	});
+});
+
+/**
+ * 阶段 12 / P12-71：`fiat skills` 子命令（技能库维护，全部离线可用）。
+ * 这里用真实的 `SkillStore` + `Curator`（写临时目录），只把 ProposalStore 换成内存实现——
+ * 「CLI 不含业务逻辑」的验证方式就是：命令行为完全由注入的 L2 能力决定。
+ */
+describe("fiat skills（P12-71）", () => {
+	let tempDir: string;
+	let skillOps: SkillOps;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `fiat-cli-skills-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(join(tempDir, "pi-skills"), { recursive: true });
+		const skills = new SkillStore(join(tempDir, "pi-skills"));
+		skills.upsertSkill({
+			name: "cashback-reconcile",
+			description: "核对返现",
+			whenToUse: ["对账"],
+			body: "## Procedure\n1. parse",
+		});
+		skillOps = createSkillOps({
+			skills,
+			proposals: new InMemoryProposalStore(),
+			config: { ...DEFAULT_EVOLUTION_CONFIG },
+		});
+	});
+
+	afterEach(() => {
+		if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("skills list：列出技能（来源 / 评测分 / 使用次数）", async () => {
+		const { io, out } = capture();
+		expect(await runCli(["skills"], makeDeps({ skills: skillOps }), io)).toBe(0);
+		expect(out.join("\n")).toContain("cashback-reconcile");
+		expect(out.join("\n")).toContain("agent");
+		expect(out.join("\n")).toContain("unverified"); // 没跑评测闸门
+	});
+
+	it("skills pin：pin 后归档被拒（免死金牌）", async () => {
+		const io = capture();
+		expect(await runCli(["skills", "pin", "cashback-reconcile"], makeDeps({ skills: skillOps }), io.io)).toBe(0);
+		expect(io.out.join("\n")).toContain("pinned");
+
+		const io2 = capture();
+		expect(await runCli(["skills", "archive", "cashback-reconcile"], makeDeps({ skills: skillOps }), io2.io)).toBe(1);
+		expect(io2.err.join("\n")).toContain("已 pinned");
+	});
+
+	it("skills archive / restore：软删可逆", async () => {
+		const io = capture();
+		expect(await runCli(["skills", "archive", "cashback-reconcile"], makeDeps({ skills: skillOps }), io.io)).toBe(0);
+
+		const io2 = capture();
+		expect(await runCli(["skills", "list"], makeDeps({ skills: skillOps }), io2.io)).toBe(0);
+		expect(io2.out.join("\n")).toContain("技能库为空");
+
+		const io3 = capture();
+		expect(await runCli(["skills", "restore", "cashback-reconcile"], makeDeps({ skills: skillOps }), io3.io)).toBe(0);
+		expect(io3.out.join("\n")).toContain("已恢复");
+	});
+
+	it("skills curate：跑维护并输出报告；--report 写文件", async () => {
+		const reportPath = join(tempDir, "REPORT.md");
+		const { io, out } = capture();
+		expect(await runCli(["skills", "curate", "--report", reportPath], makeDeps({ skills: skillOps }), io)).toBe(0);
+		expect(out.join("\n")).toContain("技能库维护报告");
+		expect(existsSync(reportPath)).toBe(true);
+	});
+
+	it("skills rollback：没有快照时明确失败（不是静默成功）", async () => {
+		const { io, err } = capture();
+		expect(await runCli(["skills", "rollback", "cashback-reconcile"], makeDeps({ skills: skillOps }), io)).toBe(1);
+		expect(err.join("\n")).toContain("没有可用快照");
+	});
+
+	it("skills 未知子命令 → 退出码 1 且提示可用子命令", async () => {
+		const { io, err } = capture();
+		expect(await runCli(["skills", "frobnicate"], makeDeps({ skills: skillOps }), io)).toBe(1);
+		expect(err.join("\n")).toContain("list / curate / pin / unpin / archive / restore / rollback");
+	});
+
+	it("未注入 skills → 明确提示技能库未配置", async () => {
+		const { io, err } = capture();
+		expect(await runCli(["skills", "list"], makeDeps(), io)).toBe(1);
+		expect(err.join("\n")).toContain("技能库未配置");
 	});
 });

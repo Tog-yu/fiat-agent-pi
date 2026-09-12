@@ -81,3 +81,12 @@ policies:
     allowed_environments: [dev, staging, prod]
     approval_required: true
     allowed_scopes: [job_apply]
+
+  # 阶段 12（P12-65）：技能正文按需读取（fiat_skill_view，policyToolName 剥前缀）。
+  # 只读工具：技能库索引已注入 systemPrompt，正文按需拉取。L1 风险，三环境可读。
+  # 注：本文件是**人写锚点**，自进化只读不写（阶段 12 硬约束 3）——这条由人（本阶段实现）添加。
+  - tool: skill_view                # 读取技能正文（注册名 fiat_skill_view）
+    risk_level: L1
+    allowed_roles: [oncall, ops, viewer]
+    allowed_environments: [dev, staging, prod]
+    allowed_scopes: [skill_read]

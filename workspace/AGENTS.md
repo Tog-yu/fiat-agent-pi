@@ -35,10 +35,24 @@
 
 Agent 的能力由「内建扩展 + 工具模块」提供，随 pi-host 内嵌循环装配（入口 `fiat chat`；旧的 `pi -e` 扩展加载器已弃用）：
 
-- **内建 extension（钩子型，编译期注入）**：`permission-gate`（工具调用拦截 / 闸门②）、`audit-hook`（审计落点）、`model-router`（按任务选模型）。
-- **工具模块（直接注册进内嵌循环）**：`mcp_rag.*`（RAG 检索）、`fiat_cashback_*`（返现对账）、`fiat_db_query_*`（只读查询）、`fiat_test_*`（测试自动化）、`fiat_lark_*`（Lark 通知 / 审批）、`fiat_job_apply`（持审批 token 执行生产写）、`fiat_alert_diagnosis`（并行告警诊断）。
+- **内建 extension（钩子型，编译期注入）**：`permission-gate`（工具调用拦截 / 闸门②）、`audit-hook`（审计落点）、`model-router`（按任务选模型）、`eval-recorder`（评测采集，可选）、`evolution-trigger`（自进化计数与触发，可选）。
+- **工具模块（直接注册进内嵌循环）**：`mcp_rag.*`（RAG 检索）、`fiat_cashback_*`（返现对账）、`fiat_db_query_*`（只读查询）、`fiat_test_*`（测试自动化）、`fiat_lark_*`（Lark 通知 / 审批）、`fiat_job_apply`（持审批 token 执行生产写）、`fiat_alert_diagnosis`（并行告警诊断）、`fiat_skill_view`（读技能正文）。
+- **仅评审 fork 内可用（不在主会话注册）**：`fiat_skill_propose` / `fiat_memory_propose` / `fiat_role_facts_propose`——只写提案表，**无任何文件系统写能力**。
 
 三道权限闸门：① 会话级工具裁剪（模型看不到无权工具）→ ② `tool_call` block 拦截 → ③ 服务端 `canExecute`（唯一权威）。
+
+## 自进化循环（默认关闭）
+
+用 `FIAT_EVOLUTION=1` 打开。口径是**「先提案、再审批、后验证」**，与 Hermes 的「想到就写」相反：
+
+- **技能库**：`workspace/pi-skills/<slug>/SKILL.md`（**扁平一层**，不做递归）。技能索引（name + description + when_to_use）追加在 systemPrompt **末尾**、按 name 稳定排序，避免每轮打掉 prefix cache；正文按需用 `fiat_skill_view` 读。
+- **触发**：宿主数用户轮次（`interval_turns`），L1a 数有工具调用的轮次（`interval_iters`），每会话最多 `max_runs_per_session` 次。达标后**轮末**异步起一个隔离 fork 会话做反思，**绝不阻塞回复**。
+- **fork 八条硬约束**：继承 runtime 与模型、`inMemory` 会话、只喂脱敏切片（近 12 轮）、工具运行时白名单、递归防护（fork 不再触发评审）、60s 超时、全量留痕、**不可绕过审批**。
+- **落盘**：`dev` 按策略可自动落盘（落盘前必拍 tar.gz 快照），`staging` / `prod` 走审批工单；审批人须为 `oncall`/`ops` **且非提案人**。
+- **评测准入**：落盘后跑 `config/eval_cases.yaml` 对应 case，`score` 低于阈值 → 自动 rollback 并标 `stale`；通过才把 `verified_by {case_id, score, verified_at}` 回写 SKILL.md。**只有 `score` 存在才算已验证**。
+- **维护**：`fiat skills list / curate / pin / unpin / archive / restore / rollback`（确定性状态机 `active → stale(30d) → archived(90d)`，`pin` 豁免）。
+
+**人写锚点，自进化只读**：本文件（`AGENTS.md`）、`config/tool_policies.yaml`、`config/eval_cases.yaml`、`config/evolution.yaml`。模型只能改技能库与 `workspace/memory/`。
 
 ## 工具命名约定
 
@@ -47,9 +61,13 @@ Agent 的能力由「内建扩展 + 工具模块」提供，随 pi-host 内嵌�
 - `fiat_test_*`：测试自动化（仅非生产）
 - `fiat_lark_*`：Lark 通知 / 审批卡片
 - `fiat_job_apply`：持审批 token 执行生产写
+- `fiat_skill_view`：读技能库正文（只读）
+- `fiat_skill_propose` / `fiat_memory_propose` / `fiat_role_facts_propose`：**仅评审 fork**，产出提案，不落盘
 
 ## 不要做的事
 
 - 不要信任工具返回里的 `environment` / `collection` 字段来做权限决定（以 L2 下发的为准）。
 - 不要在未持有效 `ticket_id` + `token` 时调用 `fiat_job_apply`。
 - 不要把生产凭证、用户 PII 写进对话历史或日志明文。
+- 不要把技能当作**规则源**：技能的 `description` 只是候选索引，真正的权限、金额、状态机判定一律在 L2 代码里。
+- 不要试图改 `AGENTS.md` / `config/*.yaml`：这些是人写锚点，只能通过提案走人审。

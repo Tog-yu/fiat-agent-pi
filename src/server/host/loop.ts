@@ -90,6 +90,15 @@ export interface HostLoopOptions {
 	 * 追加在恢复的历史之后、任何用户输入之前；配 session 时一并落盘。
 	 */
 	bootstrap?: { cwd: string; time?: string; extra?: string[] };
+	/**
+	 * 阶段 12（P12-63）：**用户轮次**结束钩子，每 `runTurn` 末尾调用一次。
+	 *
+	 * 为什么这个钩子必须在宿主而不是 L1a：Pi 的事件里**没有「用户轮次」这个事件**——
+	 * `turn_start` / `turn_end` 是 **LLM 轮**，一轮用户输入可能对应多个 LLM 轮。
+	 * 自进化需要区分「工具迭代」（L1a 可见）与「用户轮次」（只有宿主知道），
+	 * 所以轮次计数点只能在这里（§10.4 的关键修正）。
+	 */
+	onUserTurn?: () => void;
 }
 
 /** 取最后一条 assistant 消息的文本作为该轮回复 */
@@ -123,11 +132,13 @@ export class PiHostLoop {
 	private readonly resolveKey: ApiKeyResolver;
 	private readonly hostSession?: HostSession;
 	private readonly beforeAgentStart?: (prompt: string) => Promise<void>;
+	private readonly onUserTurn?: () => void;
 
 	constructor(opts: HostLoopOptions) {
 		this.resolveKey = opts.getApiKey ?? ((p) => process.env[`${p.toUpperCase()}_API_KEY`]);
 		this.hostSession = opts.session;
 		this.beforeAgentStart = opts.beforeAgentStart;
+		this.onUserTurn = opts.onUserTurn;
 
 		// streamFn：把当前 model 与透传的 options 交给 streamSimple，并补上 apiKey。
 		// Agent 在每轮调用时把 state.model 作为第一个参数传入，因此这里拿到的就是当前模型。
@@ -179,6 +190,9 @@ export class PiHostLoop {
 		if (this.hostSession) {
 			this.hostSession.syncDelta(all.slice(this.hostSession.persistedMessageCount));
 		}
+		// 阶段 12：用户轮次计数点（§10.4）。放在最后——一轮已经完整结束，
+		// 此时 L1a 的 toolResults 也早已扇出完毕，宿主侧的汇合判定拿到的是完整数据。
+		this.onUserTurn?.();
 		return lastAssistantText(all);
 	}
 

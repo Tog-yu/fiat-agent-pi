@@ -7,6 +7,7 @@
 
 import type { ApprovalTicketRecord } from "../approval/ticket.ts";
 import type { AuditRecord } from "../audit/client.ts";
+import type { SkillMeta } from "../evolution/skillStore.ts";
 import type { ToolPolicy } from "../policy/engine.ts";
 
 export interface ToolRow {
@@ -52,6 +53,24 @@ export function renderTickets(rows: readonly ApprovalTicketRecord[]): string {
 		.join("\n");
 }
 
+/**
+ * 技能库列表（`fiat skills list`，P12-71）。
+ * 列的是「维护侧最关心的四件事」：来源（能不能被自进化改）、评测分（verified / unverified）、
+ * 使用次数（Curator 的时间衰减依据）、状态标记（pinned / stale）。
+ */
+export function renderSkills(rows: readonly SkillMeta[]): string {
+	if (rows.length === 0) return "（技能库为空）";
+	return rows
+		.map((s) => {
+			// 只有评测回过分数才显示分数；只有锚点（刚落盘、未跑闸门）仍显示 unverified
+			const mark = s.verifiedBy?.score !== undefined ? s.verifiedBy.score.toFixed(2) : "unverified";
+			const flags = [s.pinned ? "pinned" : "", s.state !== "active" ? s.state : ""].filter(Boolean).join(",");
+			const used = s.lastUsedAt ? new Date(s.lastUsedAt).toISOString().slice(0, 10) : "never";
+			return `${s.name}\t${s.origin}\t${mark}\t用 ${s.useCount} 次\t最后 ${used}${flags ? `\t[${flags}]` : ""}`;
+		})
+		.join("\n");
+}
+
 export const HELP = `fiat —— 法币业务 CLI（pi-host 内嵌宿主驱动，不改 Pi 核心）
 
 用法:
@@ -74,8 +93,20 @@ export const HELP = `fiat —— 法币业务 CLI（pi-host 内嵌宿主驱动�
       --reason <text>
   tools                    查看某角色在某环境下可用的工具（闸门①预览）
       --role <ops>         --env <dev>
+  skills <子命令>           技能库维护（阶段 12 / P12-71；全部离线可用）
+      list                 列出技能（来源 / 评测分 / 使用次数 / 状态）
+      curate               跑一次确定性维护（active → stale → archived）
+            --report <path>  同时把维护报告写到文件
+      pin <name>           钉住技能（豁免 Curator，自进化也不可改写）
+      unpin <name>         取消钉住
+      archive <name>       手动归档（软删，可 restore）
+      restore <name>       从归档恢复
+      rollback <name>      回滚到最近一次落盘前拍的 tar.gz 快照
   help                     显示本帮助
 
 说明:
   chat / diagnose 需要模型（环境变量 FIAT_MODEL=provider/model + 对应密钥）；
-  未配置时该命令会明确提示，其余命令完全离线可用。`;
+  未配置时该命令会明确提示，其余命令完全离线可用。
+
+  自进化循环（阶段 12）需要 FIAT_EVOLUTION=1 才在 chat 会话里启用；
+  设计见 Obsidian「法币定制 Agent DEV_SPEC（Pi 版）」§10。`;

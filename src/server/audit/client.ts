@@ -10,6 +10,13 @@
 
 import type { FiatUser } from "../policy/engine.ts";
 
+/**
+ * 审计结论。
+ *
+ * 阶段 12（P12-69）扩了四个自进化取值——**只增不改**，与「审计只追加」的语义一致：
+ * 自进化本身必须可审计（§10.9 双写口径），而它既不是工具调用也不是业务工单，
+ * 硬塞进 `applied` / `ticket_approved` 会让审计查询分不清「谁改了自己的行为」。
+ */
 export type AuditOutcome =
 	| "allowed"
 	| "blocked"
@@ -17,7 +24,11 @@ export type AuditOutcome =
 	| "ticket_created"
 	| "ticket_approved"
 	| "ticket_rejected"
-	| "applied";
+	| "applied"
+	| "evolution_proposed"
+	| "evolution_applied"
+	| "evolution_rejected"
+	| "evolution_rolled_back";
 
 export interface AuditRecord {
 	ts: string;

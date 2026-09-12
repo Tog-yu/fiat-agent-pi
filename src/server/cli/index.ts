@@ -13,7 +13,8 @@ import type { AuditQuery, AuditReader } from "../audit/reader.ts";
 import type { ToolPolicy } from "../policy/engine.ts";
 import { intFlag, parseArgs } from "./args.ts";
 import type { ChatFactory } from "./chat.ts";
-import { allowedTools, HELP, renderAudit, renderTickets, renderTools } from "./commands.ts";
+import { allowedTools, HELP, renderAudit, renderSkills, renderTickets, renderTools } from "./commands.ts";
+import type { SkillOps } from "./skills.ts";
 
 export interface DiagnosisInput {
 	title: string;
@@ -35,6 +36,11 @@ export interface CliDeps {
 	 * 未配置 FIAT_MODEL 时为 undefined —— 与 diagnose 同口径明确提示。
 	 */
 	chat?: ChatFactory;
+	/**
+	 * 阶段 12 / P12-71：技能库维护（`fiat skills ...`）。
+	 * 缺省时该命令明确提示「技能库未配置」，而不是静默成功。
+	 */
+	skills?: SkillOps;
 }
 
 export interface CliIo {
@@ -66,6 +72,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps, io: CliIo):
 			return cmdReject(positional, flags, deps, io);
 		case "tools":
 			return cmdTools(flags, deps, io);
+		case "skills":
+			return cmdSkills(positional, flags, deps, io);
 		default:
 			io.err(`未知命令：${command}\n\n${HELP}`);
 			return 1;
@@ -225,6 +233,91 @@ async function cmdTools(flags: Record<string, string>, deps: CliDeps, io: CliIo)
 	const env = flags.env ?? "dev";
 	io.out(renderTools(allowedTools(deps.policies, role, env)));
 	return 0;
+}
+
+/**
+ * 阶段 12 / P12-71：`fiat skills <子命令>`。
+ * 全部离线可用（技能库在 workspace/pi-skills，不依赖模型 / Pi 运行时）。
+ */
+async function cmdSkills(
+	positional: readonly string[],
+	flags: Record<string, string>,
+	deps: CliDeps,
+	io: CliIo,
+): Promise<number> {
+	const ops = deps.skills;
+	if (!ops) {
+		io.err("技能库未配置：skills 需要 workspace/pi-skills 目录。");
+		return 1;
+	}
+	const sub = positional[0] ?? "list";
+	const name = positional[1];
+
+	switch (sub) {
+		case "list": {
+			io.out(renderSkills(ops.list()));
+			return 0;
+		}
+		case "curate": {
+			io.out(ops.curate(flags.report).report);
+			if (flags.report) io.out(`报告已写入：${flags.report}`);
+			return 0;
+		}
+		case "pin":
+		case "unpin": {
+			if (!name) {
+				io.err(`用法：fiat skills ${sub} <name>`);
+				return 1;
+			}
+			const pinned = sub === "pin";
+			if (!ops.setPinned(name, pinned)) {
+				io.err(`技能不存在：${name}`);
+				return 1;
+			}
+			io.out(`${name} → ${pinned ? "pinned（豁免 Curator，自进化不可改写）" : "unpinned"}`);
+			return 0;
+		}
+		case "archive": {
+			if (!name) {
+				io.err("用法：fiat skills archive <name>");
+				return 1;
+			}
+			if (!ops.archive(name)) {
+				io.err(`归档失败（技能不存在或已 pinned）：${name}`);
+				return 1;
+			}
+			io.out(`已归档（软删，可 restore）：${name}`);
+			return 0;
+		}
+		case "restore": {
+			if (!name) {
+				io.err("用法：fiat skills restore <name>");
+				return 1;
+			}
+			if (!ops.restore(name)) {
+				io.err(`恢复失败（没有归档记录）：${name}`);
+				return 1;
+			}
+			io.out(`已恢复：${name}`);
+			return 0;
+		}
+		case "rollback": {
+			if (!name) {
+				io.err("用法：fiat skills rollback <name>");
+				return 1;
+			}
+			const r = await ops.rollback(name);
+			if (!r.ok) {
+				io.err(r.message);
+				return 1;
+			}
+			io.out(r.message);
+			return 0;
+		}
+		default:
+			io.err(`未知子命令：skills ${sub}\n\n可用：list / curate / pin / unpin / archive / restore / rollback`);
+			return 1;
+	}
 }
 
 function errText(e: unknown): string {

@@ -26,15 +26,20 @@ import type { RunOne, TaskOutcome } from "../diagnosis/fanout.ts";
 import type { DiagnosisAngle } from "../diagnosis/plan.ts";
 import type { EvalSink } from "../eval/sink.ts";
 import type { EvalCase } from "../eval/types.ts";
+import { composeSystemPrompt } from "../evolution/index-prompt.ts";
+import type { MemoryStore } from "../evolution/memoryStore.ts";
+import type { SkillStore } from "../evolution/skillStore.ts";
 import { defineHostTools, type HostTool } from "../host/contracts.ts";
 import { createAuditHook } from "../host/l1a/audit-hook.ts";
 import { createEvalRecorder } from "../host/l1a/eval-recorder.ts";
+import type { EvolutionTrigger } from "../host/l1a/evolution-trigger.ts";
 import { createModelRouter, type ModelResolver, type RouteApplied } from "../host/l1a/model-router.ts";
 import { createPermissionGate } from "../host/l1a/permission-gate.ts";
 import { createAlertFanout } from "../host/l1b/alert-fanout.ts";
 import { createFiatTools } from "../host/l1b/fiat-tools.ts";
 import { createJobApply } from "../host/l1b/job-apply.ts";
 import { createMcpRagTools, type McpClientLike, type RagMcpConfig, type RagStatus } from "../host/l1b/mcp-rag.ts";
+import { createSkillTools } from "../host/l1b/skill-tools.ts";
 import { loadModelPolicies, type ModelPolicies } from "../models/router.ts";
 import { LocalPolicyClient, type PolicyClient } from "../policy/client.ts";
 import { loadPolicies, type ToolPolicy } from "../policy/engine.ts";
@@ -93,6 +98,25 @@ export interface SessionFactoryOptions {
 	evalCase?: EvalCase;
 	/** 阶段 11：P6-25 子会话挂父 run（多体轨迹关联） */
 	parentRunId?: string;
+	/**
+	 * 阶段 12（P12-65/63）：自进化接线。**三件东西全部可选、缺省什么都不注册**：
+	 *   - `skillStore`：注册 `fiat_skill_view`（按需读技能正文）+ 把技能索引拼进 systemPrompt 末尾
+	 *   - `memoryStore`：把「近期事实」摘要段拼进 systemPrompt 末尾（提示层）
+	 *   - `trigger`：L1a 工具迭代计数器（**尾部追加，不插队**，位置契约
+	 *     `[gate, audit, modelRouter, ...evalRecorder?, ...evolutionTrigger?]`）
+	 *
+	 * ⚠️ 传递进来的 trigger 只会被「主会话」使用；**评审 fork 绝不传**（§10.7 第 5 条
+	 * 递归防护）——fork 是在别处单独装配的，走不到这条路径。
+	 */
+	evolution?: {
+		skillStore: SkillStore;
+		memoryStore?: MemoryStore;
+		trigger?: EvolutionTrigger;
+		/** 是否注入 role 运行约定（默认关，§10.2 第 2 条） */
+		includeRoleFacts?: boolean;
+		/** 注入的「近期事实」条数 / 字数上限（缺省用 memoryStore 的默认双截断） */
+		memoryDays?: number;
+	};
 }
 
 export interface SessionFactoryResult {
@@ -110,6 +134,13 @@ export interface SessionFactoryResult {
 	extensionFactories: Array<(pi: ExtensionAPI) => void>;
 	/** L1b 工具通道：直接注册进内嵌循环的工具模块产物（mcp-rag / fiat-tools / job-apply / alert-fanout） */
 	hostTools: HostTool[];
+	/**
+	 * 阶段 12（P12-65）：要**追加在 systemPrompt 末尾**的自进化段落
+	 * （技能索引 + 近期事实 + 角色运行约定，按此顺序，段间空行）。
+	 * 没开自进化时为空串 —— 调用方 `systemPrompt: built.evolutionPrompt || undefined`
+	 * 即可保持与以前字节级一致（也为 prefix cache 保留了稳定性）。
+	 */
+	evolutionPrompt: string;
 }
 
 /**
@@ -214,7 +245,12 @@ export async function buildSession(
 			}),
 		);
 	}
-	const hostTools = defineHostTools([...mcpRagTools, ...fiatTools, ...jobApply]);
+	// 阶段 12（P12-63）：evolution-trigger **尾部追加，不插队**。
+	// 位置契约：[gate, audit, modelRouter, ...evalRecorder?, ...evolutionTrigger?]
+	if (opts.evolution?.trigger) factories.push(opts.evolution.trigger.factory);
+
+	const skillTools = opts.evolution ? createSkillTools({ store: opts.evolution.skillStore, allowedTools }) : [];
+	const hostTools = defineHostTools([...mcpRagTools, ...fiatTools, ...jobApply, ...skillTools]);
 	if (opts.diagnosisRunner) {
 		hostTools.push(
 			...createAlertFanout({
@@ -228,6 +264,20 @@ export async function buildSession(
 		);
 	}
 
+	// 阶段 12（P12-65）：自进化段落 —— 技能索引 / 近期事实 / 角色运行约定，按此顺序追加在末尾。
+	// 记忆段是**提示层**：只注入事实，绝不把规则带进判定链（§10.3 铁律）。
+	const evolutionPrompt = opts.evolution
+		? composeSystemPrompt("", {
+				skills: opts.evolution.skillStore.index(),
+				...(opts.evolution.memoryStore
+					? { memory: opts.evolution.memoryStore.recentFacts(opts.evolution.memoryDays ?? 3) }
+					: {}),
+				...(opts.evolution.includeRoleFacts && opts.evolution.memoryStore
+					? { roleFacts: opts.evolution.memoryStore.roleFacts(subject.user.role) }
+					: {}),
+			})
+		: "";
+
 	return {
 		policies,
 		allowedTools,
@@ -238,5 +288,6 @@ export async function buildSession(
 		modelPolicies,
 		extensionFactories: factories,
 		hostTools,
+		evolutionPrompt,
 	};
 }

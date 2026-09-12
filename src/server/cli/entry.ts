@@ -13,6 +13,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { LocalLarkClient } from "../../../src/server/approval/lark.ts";
@@ -21,14 +22,24 @@ import { type AuditClient, InMemoryAuditClient } from "../../../src/server/audit
 import { InMemoryAuditReader } from "../../../src/server/audit/reader.ts";
 import { runFanout } from "../../../src/server/diagnosis/fanout.ts";
 import { diagnosisPlan, renderReport } from "../../../src/server/diagnosis/plan.ts";
+import { loadEvalCases } from "../../../src/server/eval/cases.ts";
+import { loadEvolutionConfig } from "../../../src/server/evolution/config.ts";
+import { MemoryStore } from "../../../src/server/evolution/memoryStore.ts";
+import {
+	InMemoryProposalStore,
+	InMemoryRunStore,
+	type ProposalStore,
+} from "../../../src/server/evolution/proposalStore.ts";
+import { SkillStore } from "../../../src/server/evolution/skillStore.ts";
 import { type FiatToolClient, LocalFiatClient } from "../../../src/server/fiat-tools/client.ts";
 import { loadModelPolicies, piApiName } from "../../../src/server/models/router.ts";
 import { LocalPolicyClient, type PolicyClient } from "../../../src/server/policy/client.ts";
 import { loadPolicies, policyToolName } from "../../../src/server/policy/engine.ts";
 import type { SessionSubject } from "../../../src/server/session/factory.ts";
 import { allowedToolPredicate } from "../../../src/server/session/predicate.ts";
-import { makeChat } from "./chat.ts";
+import { type EvolutionWiring, makeChat } from "./chat.ts";
 import { type CliDeps, type DiagnosisInput, runCli } from "./index.ts";
+import { createSkillOps } from "./skills.ts";
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_CTX = 128_000;
@@ -38,6 +49,10 @@ const sha256 = (s: string): string => createHash("sha256").update(s).digest("hex
 /** 默认策略路径：仓库根 config/，按本文件位置推算，不依赖 cwd */
 const DEFAULT_POLICIES_PATH = fileURLToPath(new URL("../../../config/tool_policies.yaml", import.meta.url));
 const DEFAULT_MODEL_POLICIES_PATH = fileURLToPath(new URL("../../../config/model_policies.yaml", import.meta.url));
+const DEFAULT_EVOLUTION_PATH = fileURLToPath(new URL("../../../config/evolution.yaml", import.meta.url));
+const DEFAULT_EVAL_CASES_PATH = fileURLToPath(new URL("../../../config/eval_cases.yaml", import.meta.url));
+/** 技能库 / 记忆目录的宿主根（与 chat 的 cwd 同一处） */
+const WORKSPACE_DIR = fileURLToPath(new URL("../../../workspace", import.meta.url));
 
 function cliSubject(): SessionSubject {
 	const role = process.env.FIAT_ROLE ?? "ops";
@@ -68,6 +83,13 @@ function bootstrapCliDeps(): CliDeps {
 		sessionId: "cli",
 	});
 
+	// 阶段 12（P12-64/71）：技能库 / 记忆目录 / 提案表。全部落在 workspace 下，
+	// 与 chat 会话的 cwd 一致（技能库是「这个 agent 的东西」，不是进程级全局）。
+	const skillStore = new SkillStore(join(WORKSPACE_DIR, "pi-skills"));
+	const memoryStore = new MemoryStore({ workspace: WORKSPACE_DIR });
+	const proposals: ProposalStore = new InMemoryProposalStore();
+	const evolutionConfig = loadEvolutionConfig(DEFAULT_EVOLUTION_PATH);
+
 	return {
 		policies,
 		audit,
@@ -75,7 +97,58 @@ function bootstrapCliDeps(): CliDeps {
 		approveTicket: (id) => approval.approve(id),
 		rejectTicket: (id, reason) => approval.reject(id, reason),
 		diagnose: makeDiagnose(policiesPath, auditClient),
-		chat: makeChat({ policiesPath, auditClient }),
+		chat: makeChat({
+			policiesPath,
+			auditClient,
+			evolution: evolutionWiring({ skillStore, memoryStore, proposals, evolutionConfig, auditClient }),
+		}),
+		skills: createSkillOps({ skills: skillStore, proposals, config: evolutionConfig }),
+	};
+}
+
+/**
+ * 阶段 12：自进化接线的开关。
+ *
+ * **默认关**（`FIAT_EVOLUTION=1` 才开），三个理由：
+ *   1. 自进化会花钱（每次评审 fork 是一次完整 LLM 会话）——默认开会让一次 `fiat chat` 静默产生额外成本；
+ *   2. 它会改磁盘（dev 环境自动落盘）——默认写用户的工作目录不合适；
+ *   3. 关掉时整条链路（触发器 / 技能索引 / fork）都不装配，行为与阶段 11 完全一致，便于排查。
+ *
+ * eval case 加载失败时**只关闸门、不关整条循环**：没有 case 的技能落盘后停在 unverified
+ * （`verify.ts` 的 `no_case` 分支），仍然可注入、可人工 rollback。
+ */
+function evolutionWiring(args: {
+	skillStore: SkillStore;
+	memoryStore: MemoryStore;
+	proposals: ProposalStore;
+	evolutionConfig: ReturnType<typeof loadEvolutionConfig>;
+	auditClient: AuditClient;
+}): EvolutionWiring | undefined {
+	if (process.env.FIAT_EVOLUTION !== "1") return undefined;
+
+	let evalCases: ReturnType<typeof loadEvalCases> | undefined;
+	try {
+		evalCases = loadEvalCases(DEFAULT_EVAL_CASES_PATH);
+	} catch (e) {
+		process.stderr.write(`[evolution] eval_cases.yaml 加载失败，评测闸门停用：${e instanceof Error ? e.message : e}\n`);
+	}
+
+	return {
+		config: args.evolutionConfig,
+		skillStore: args.skillStore,
+		memoryStore: args.memoryStore,
+		proposals: args.proposals,
+		runs: new InMemoryRunStore(),
+		...(evalCases ? { evalCases } : {}),
+		onEvolution: (r) => {
+			const detail = r.outcomes.map((o) => `${o.proposalId.slice(0, 8)}:${o.decision}`).join(", ");
+			process.stderr.write(
+				`[evolution] 触发 ${r.trigger}｜run ${r.run.runId.slice(0, 8)}｜${r.run.status}｜提案 ${r.run.proposalsN} 条${detail ? `（${detail}）` : ""}\n`,
+			);
+		},
+		log: (level, message, detail) => {
+			process.stderr.write(`[evolution:${level}] ${message}${detail ? ` ${JSON.stringify(detail)}` : ""}\n`);
+		},
 	};
 }
 

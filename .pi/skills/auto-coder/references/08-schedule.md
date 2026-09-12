@@ -156,5 +156,42 @@ first_step  = 1 if 实际首工具 ∈ any_of else 0
 - [x] P11-61 **CI case 闭环**：跑真实 `config/tool_policies.yaml`（不放宽）+ stub Lark/Fiat client，`cashback-reconcile-approval` case 全链路出分 ≥ threshold（含 viewer 越权场景：gate ①裁剪后猜名调用 → not found 记 blocked + outcome 一票否决）；同步 `npm run check` 全绿
   - ⚠️ 验收注记（2026-09-07）：「全量 vitest 全绿」达成 **196/199**——3 个失败（`cli-chat.test.ts` ×2、`host-duties.test.ts` ×1）为 **5s 超时**，经 git worktree 干净基线（HEAD `6d685a5`，移除本阶段全部改动后重跑同组测试）复现同样 3 失败，确认是**既有环境问题**（vitest forks worker 在本机负载下的启动/执行超时），与阶段 11 改动无关。全量跑时 vitest worker 报 `Failed to start forks worker ... Timeout waiting for worker to respond`；单独分批重跑这些文件时部分可过，属 flaky。后续可作为独立任务（调 `testTimeout` / 改 `pool: "threads"`）处理，不阻塞本阶段。
 
+### 阶段 12：自进化循环（轮末反思 → 提案 → 审批 → 评测准入）
+
+验收：faux 驱动一场会话，工具迭代达标后**轮末**触发评审 fork；fork 的**白名单外工具被运行时拒绝**、且 fork **不再触发评审**（递归防护）；产出提案落 `fiat_evolution_proposal`；`dev` 自动落盘（含 tar.gz 快照）、`staging/prod` 落审批工单；落盘技能在 CI 跑对应 eval case，分数低于基线**自动 rollback**；`npm run check` + `npm test` 全绿（新增 evolution 用例）。
+
+设计依据：Obsidian `法币 agent/法币定制 Agent DEV_SPEC（Pi 版）.md` **§10 自进化循环**（含流程图 `fiat-agent-pi-自进化闭环.svg`）。
+一句话口径：**Hermes 是「想到就写」，fiat 是「先提案、再审批、后验证」** —— fork 只有提案工具，落盘与判定都在 L2 确定性代码。
+
+- [x] P12-62 **契约与配置**：`src/server/evolution/types.ts`（`EvolutionProposal` / `EvolutionRun` / `TriggerKind` / `Decision`）+ `config/evolution.yaml`（`intervalIters: 10` / `intervalTurns: 10` / `maxRunsPerSession: 3` / `timeoutMs: 60000` / `autoApplyDev: true` / `roleFactsEnabled: false`）
+- [x] P12-63 **触发器 L1a**：`src/server/host/l1a/evolution-trigger.ts` —— 订阅 `turn_end`（本轮有 `toolResults` 则 `itersSinceSkill += 1`）与 `agent_end`（`snapshot()` 上报）；**缺省不注册（fail-safe，现有测试零改动）**；factory 尾部追加，位置契约 `[gate, audit, modelRouter, ...evalRecorder?, ...evolutionTrigger?]`
+- [x] P12-64 **技能库存储**：`src/server/evolution/skillStore.ts` —— 扫描 `workspace/pi-skills/*/SKILL.md`（**扁平一层**，对齐踩坑表「扩展路径只递归一层」）/ 解析 frontmatter / 读正文 / 原子写 / 归档 / `.origin.json`（`agent` \| `human`）/ `.usage.json` 遥测 / `applyProposal` 前 tar.gz 快照 + `rollback`
+- [x] P12-65 **候选注入**：技能索引（name + ≤60 字 description + when_to_use）追加进 `HostResources.systemPrompt` **末尾**（按 name 稳定排序，避免每轮打掉 prefix cache）；L1b 工具 `fiat_skill_view(name, file_path?)` 按需读正文
+- [x] P12-66 **评审 fork**：`src/server/evolution/reviewer.ts` —— `HostSession.inMemory` + **脱敏切片**（近 12 轮：user 摘要 / 工具名 / isError / 输出摘要）+ 继承 runtime（同模型命中同一 prefix cache）+ 两个计数器置 0 + 60s 超时 + 失败只记日志（**永不阻塞回复**）
+- [x] P12-67 **提案工具（L1b，只在 fork 会话注册）**：`fiat_skill_propose` / `fiat_memory_propose` / `fiat_role_facts_propose` → **只写 `ProposalStore`，不落盘**；配合运行时白名单，生产写工具（`fiat_job_apply` / `fiat_cashback_reconcile`）一律不在
+- [x] P12-68 **落盘判定**：`src/server/evolution/policy.ts`（纯函数，**零 Pi 依赖**）—— 保护清单 / 脱敏扫描 / 技能规范（缺 when_to_use、description > 60 字）/ 重复检测（slug 冲突 + 相似度 > 0.85）→ `auto_apply` \| `needs_approval` \| `reject`；并把 §10.8 三条禁令做成**正则兜底**
+- [x] P12-69 **审批桥与落盘**：复用 `ApprovalService` + Lark 卡片（**审批人 = oncall/ops 且非提案人**）→ `applyProposal`（原子写 + 快照 + `fiat_evolution_*` 与 `fiat_audit_log` **双写**）；幂等键 = `hash(target + 归一化正文)`
+- [x] P12-70 **评测闸门**：落盘技能按 `verified_by.case_id` 关联 `config/eval_cases.yaml`；跑对应 case，score < 基线 → 自动 rollback + 标 `stale`；通过则把 `verified_by {case_id, score, verified_at}` 回写 SKILL.md
+- [x] P12-71 **Curator（维护侧，可独立延后）**：确定性状态机 `active → stale(30d) → archived(90d)` + `pin` 保护 + CLI `fiat skills list / pin / archive / restore / rollback`
+- [x] P12-72 **测试与文档**：`test/evolution-trigger.test.ts`（计数与触发阈值）/ `evolution-policy.test.ts`（纯函数分支全覆盖）/ `evolution-reviewer.test.ts`（faux 驱动：白名单拦截 + 递归防护 + 提案落库 + 超时兜底）/ `evolution-apply.test.ts`（dev 自动落盘 + 审批路径 + rollback）；同步 `AGENTS.md` 与设计文档 §10
+  - ✅ 验收注记（2026-09-12）：新建 16 个源文件（`src/server/evolution/` 13 个 + `host/l1a/evolution-trigger.ts` + `host/l1b/{skill-tools,propose-tools}.ts` + `cli/skills.ts`，另 `config/evolution.yaml`），改动 9 个既有文件（`host/loop.ts` / `session/factory.ts` / `audit/client.ts` / `config/tool_policies.yaml` / `cli/{commands,index,chat,entry}.ts`）。
+  - 📐 **相对原任务清单的两处增量**（实现时发现必要，非计划外扩张）：
+    1. **判定规则从 4 类扩到 11 条**（`DecisionRule`）：原清单只有「保护清单 / 脱敏 / 技能规范 / 重复」，实际还需 `role_facts_disabled`（第三路默认关）、`spec_violation`（缺 `when_to_use`）、`env_approval`（非 dev 强制人审）、`self_approval`（审批人 = 提案人）等分支，否则 `role_facts_enabled: false` 与「审批人非提案人」两条硬约束落不了地。
+    2. **测试文件 4 → 6**：原列 4 个，实际加 `evolution-skillstore.test.ts`（25 个，能力 / 防护 / 确定性）与 `cli.test.ts` 追加 7 个。补这两个是因为 skillStore 是**唯一落盘出口**，CLI 是运维实际入口，都值得独立覆盖。
+  - 🐛 **测试暴露并修掉的 2 个真实缺陷**（这是本阶段最有价值的产出，靠写测试才浮出来）：
+    - **① 落盘即「已验证」**：`upsertSkill` 原本写入 `verified_by {case_id, score: 0, verified_at: now}`。后果是**刚落盘的技能分数为 0 却被判为「已验证」**，在索引里排进 verified 组，直接绕过 P12-70 的评测准入。修复为**锚点与凭证分离**：落盘只写 `case_id`（锚点），`score` / `verified_at` 只有评测通过才由 `setVerified()` 回写；所有「是否 verified」的判定统一改为 `score !== undefined`。含义是「内容一改，旧的验证结论就失效」——这正是我们要的语义。
+    - **② rollback 回滚不干净**：`rollback()` 原本只 `tar -xzf` 解包。tar **只覆盖/新增、不删除**，于是回滚一个**新技能**（快照里本就没有它）时目录留在原地——状态标成 `rolled_back`，磁盘上却还躺着一个不该存在的技能，评测判它不达标但文件没被清掉。修复为**先清空再解包**（保留 `.backups` / `.origin.json` / `.usage.json` 三类维护侧状态），`snapshot()` 同步排除这三项。因为精确回滚是「不达标自动 rollback」这条链路的最后一道保险，脏回滚比不回滚更危险。
+  - 验收结果：`npm run check` → `Checked 110 files. No fixes applied.`；`npm test` → **34 files / 299 tests 全绿**（阶段 11 基线为 29 文件 / 204 用例，本阶段净增 5 文件 / 95 用例）。文档侧已同步 `workspace/AGENTS.md`（新增「自进化循环（默认关闭）」一节 + 工具命名 + 禁写锚点）与本设计文档 §10。
+
+**阶段 12 硬约束（实现时不得破）**：
+
+1. 评审 fork **不给写能力**：只有 `*_propose` + 只读工具。
+2. 落盘判定与写文件**都在 L2 确定性代码**，LLM 只产出候选文本。
+3. 自进化**不写** `AGENTS.md` / `tool_policies.yaml` / `eval_cases.yaml`（人写锚点，只读）。
+4. `workspace/memory/` 只作**提示层**：不得成为金额 / 状态机 / 字段校验的第二规则源。
+5. 不做个人画像（第三路按 `role` 聚合且默认关）。
+6. **不打开 Pi 的 skills 通道**（`noSkills` 保持 `true`），索引 / 正文 / 写入全自研。
+7. 每次评审与落盘都留痕：`fiat_evolution_run` / `fiat_evolution_proposal` + `fiat_audit_log` 双写。
+
 ---
 

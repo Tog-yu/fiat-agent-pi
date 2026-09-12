@@ -1,0 +1,38 @@
+# 自进化循环配置（阶段 12 / P12-62）
+#
+# 设计依据：Obsidian `法币 agent/法币定制 Agent DEV_SPEC（Pi 版）.md` §10。
+# 本文件是**人写的锚点**（与 tool_policies.yaml / eval_cases.yaml 同级）——
+# 自进化循环只读它，**永不写它**（阶段 12 硬约束 3）。
+#
+# 缺省值本文件未给时取 src/server/evolution/types.ts 的 DEFAULT_EVOLUTION_CONFIG。
+
+evolution:
+  # ── 触发（§10.4）─────────────────────────────────────────────
+  # 两个计数器语义不同，不可合并：
+  #   interval_iters = 工具迭代（L1a evolution-trigger 数，默认对齐 Hermes skills.creation_nudge_interval）
+  #   interval_turns = 用户轮次（PiHostLoop.runTurn 数，默认对齐 Hermes memory.nudge_interval）
+  interval_iters: 10
+  interval_turns: 10
+  # 单会话评审预算：超了就不再触发（避免一次长会话反复 fork）
+  max_runs_per_session: 3
+
+  # ── 评审 fork（§10.7）───────────────────────────────────────
+  # 超时只记日志，永不阻塞用户回复
+  timeout_ms: 60000
+  # 脱敏切片回放的轮数：只回放「user 摘要 + 工具名 + isError + 输出摘要」，不落 prompt 全文
+  slice_turns: 12
+
+  # ── 落盘判定（§10.5）────────────────────────────────────────
+  # dev 自动落盘 / staging·prod 走 ApprovalService + Lark 卡片
+  auto_apply_dev: true
+  # 第三路（按 role 的运行约定）默认关：fiat 是内部多角色业务 Agent，不做个人画像
+  role_facts_enabled: false
+  # 与已有技能的正文相似度超过它 → needs_approval（合并 or 新建，人判）
+  duplicate_threshold: 0.85
+  # description 字数上限（§10.6）；超了被 policy 拒
+  description_max_chars: 60
+
+  # ── 维护侧 Curator（P12-71，§10.1 第 6 条）───────────────────
+  # 确定性状态机 active → stale → archived；pinned 一律豁免
+  stale_after_days: 30
+  archive_after_days: 90
