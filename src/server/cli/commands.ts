@@ -102,6 +102,10 @@ export const HELP = `fiat —— 法币业务 CLI（pi-host 内嵌宿主驱动�
       archive <name>       手动归档（软删，可 restore）
       restore <name>       从归档恢复
       rollback <name>      回滚到最近一次落盘前拍的 tar.gz 快照
+  gateway                  告警 webhook 网关（常驻进程，前台跑；P13-74）
+      --verbose            打印每个请求的处理结果
+      POST /hooks/alert 接告警平台推送：Bearer token 鉴权 → fingerprint 去重
+      → severity 分级（P0/P1 自动并行诊断，P2+ 落库 + Lark 摘要卡）
   help                     显示本帮助
 
 说明:

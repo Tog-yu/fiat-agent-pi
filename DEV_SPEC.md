@@ -501,6 +501,35 @@ first_step  = 1 if 实际首工具 ∈ any_of else 0
 6. **不打开 Pi 的 skills 通道**（`noSkills` 保持 `true`），索引 / 正文 / 写入全自研。
 7. 每次评审与落盘都留痕：`fiat_evolution_run` / `fiat_evolution_proposal` + `fiat_audit_log` 双写。
 
+### 阶段 13：告警 webhook 网关（gateway 常驻进程 + hooks 端点，参考 OpenClaw）
+
+> 方向确认于 2026-09-16。触发背景：目前告警只能**人肉从 CLI 带进来**（`fiat diagnose <标题>`，cli/commands.ts:83）或模型在会话内自调 `fiat_alert_diagnosis` 工具——`AlertInput`（diagnosis/plan.ts:17）只有 `title/service/window/detail` 4 个自然语言字段，**没有告警平台推送链路**，也没有常驻进程与 HTTP 服务（`src/` 全仓无 `listen()`）。本阶段补上「告警平台 → webhook → 常驻网关 → 自动诊断 → Lark 回推」这条自动链路。
+
+验收：`fiat gateway` 起常驻进程（仅 loopback），告警平台（或 curl 模拟）`POST /hooks/alert` 带 Bearer token 推一条告警 → 网关鉴权、按 fingerprint 去重落库 → 按 severity 分级：P0/P1 自动起 AgentSession 跑并行诊断（同三道闸门、同审计链）→ 报告经 Lark 回推值班群；P2+ 只落库摘要等人触发；重复推送（同 fingerprint 未恢复）不重复诊断；token 错误 / payload 非法返回 4xx 且不影响主进程；`npm run check` + `npm test` 全绿（新增 gateway 用例）。
+
+设计依据：OpenClaw gateway hooks 设计（`openclaw/docs/gateway/index.md`「Runtime model」单端口常驻进程 + `openclaw/docs/automation/cron-jobs.md`「Webhooks」：`hooks.enabled + token` 鉴权、`POST /hooks/agent` 起 isolated turn、`hooks.mappings` 把任意 payload 转成动作、安全边界）。对应关系：openclaw 的 gateway ≈ 本阶段 `fiat gateway` 进程；`/hooks/agent` ≈ `POST /hooks/alert` + 诊断执行链；`hooks.mappings` ≈ payload 适配层（各告警平台字段不同，转换集中在 L2 确定性代码，不进 LLM）。
+
+一句话口径：**网关只做「收、验、存、派」四件确定性的事，诊断逻辑一行不写**——payload 转 `AlertInput` 后复用既有 `diagnosisPlan()` / `runFanout()` / `renderReport()` 纯函数链，闸门与审计天然同链（踩坑表「宿主级功能塞不进 Pi extension」：HTTP / webhook / 密钥一律放宿主层 L2）。
+
+- [x] P13-73 **契约与配置**：`src/server/gateway/types.ts`（`AlertEnvelope`：`alert_id` / `fingerprint` / `severity: "P0"|"P1"|"P2"|"P3"` / `fired_at` / `status: "firing"|"resolved"` / `source` / `alert: AlertInput`——**AlertInput 本体保持 4 字段不动**，它是给模型看的压缩视图，结构化字段只在信封与持久化层）+ `config/gateway.yaml`（`port` / `bind: "loopback"` / `token`（独立 hook token，**不复用其他凭据**）/ `autoDiagnoseSeverities: ["P0","P1"]` / `dedupeTtlMinutes` / `maxInflightPerService`）
+- [x] P13-74 **HTTP 服务骨架**：`src/server/gateway/server.ts` —— `node:http` 起服务（**零新依赖**，对齐 CLI「纯 Node、零新依赖」惯例），仅 loopback bind；请求体大小上限（如 64KB）+ 超时；进程级错误隔离：单请求异常不影响主监听
+- [x] P13-75 **hooks 端点与鉴权**：`POST /hooks/alert` —— Bearer token 恒定时间比对（防时序侧信道）；token 缺失/错误 → 401，payload 非法（schema 校验）→ 400；健康检查 `GET /healthz`；**query string 里传 token 一律拒绝**（对齐 openclaw 口径）
+- [x] P13-76 **payload 适配层（mapping）**：`src/server/gateway/adapters.ts` —— 各告警平台 payload → `AlertEnvelope` 的纯函数转换器；首版先实现一个通用 JSON 适配器（字段映射表驱动，config 里可配 `titleField` / `serviceField` 等），后续按接入的平台（Prometheus Alertmanager / 灯塔 / 自研）逐个加；转换失败明确报错不猜字段。**fingerprint 生成规则**（适配层职责，纯函数）：平台自带 fingerprint/dedup 键（如 Alertmanager 的 `fingerprint`）则**透传**；否则本地算 `sha256(source + "|" + alertName + "|" + service + "|" + sorted(labels_json))` —— 刻意**不含 timestamp / 实例 ip / 计数值**，保证「同一条告警的重试与重复通知」哈希一致，而「换了实例/换了的标签集」是不同指纹。**severity 归一化**：severity 由告警平台判定、随 payload 传入，网关**只做映射不判断**（critical/fatal→P0、error/high→P1、warn→P2、info→P3 映射表可配）；payload 缺 severity 或映射表未命中 → 一律降级 P2（宁可少自动诊断，不可误触发）
+- [x] P13-77 **幂等与持久化**：`src/server/gateway/store.ts` —— SQLite 表 `fiat_alert_event`（`id` / `fingerprint` / `status` / `severity` / `envelope_json` / `diagnosis_session_id?` / `created_at` / `last_seen_at` / `last_diagnosis_at?`）；幂等判定（store 层纯查询 + 插入/更新，**单进程内用 SQLite 串行性兜底，不加分布式锁**）：`SELECT ... WHERE fingerprint = ? AND status = 'firing'` 命中 → 只 `UPDATE last_seen_at = now`（若 `severity` 比现存**升级**则视为新事件重新诊断，降级只记不改）；未命中 → INSERT + 触发下游分级。`resolved` 推送 → `status='resolved'` 关闭活跃告警；`dedupeTtlMinutes` 兜底：firing 超过该时长无后续推送 → 视为过期（平台丢了 resolved），状态改 `stale`，此后同 fingerprint 再来按新事件处理。表结构与会话存储同库（复用既有 SQLite 栈）
+- [x] P13-78 **severity 分级策略**：`src/server/gateway/policy.ts`（纯函数，零 Pi 依赖）—— P0/P1 → 自动起诊断；P2/P3 → 只落库 + Lark 发摘要卡（带「让 Agent 诊断」的触发指引，人回一句即可唤起）。**限流（防告警风暴）逻辑**：per-service **inflight 计数器**（进程内 `Map<service, number>`，诊断开始 +1、结束（成功/失败/超时）-1）+ 有界等待队列；新告警到闸：`inflight < maxInflightPerService` → 立即诊断；`≥ max` 且队列未满 → 入队（**同 fingerprint 的等待期内新推送合并去重**）；队列满 → 事件标 `throttled` 落库 + 汇总后 Lark 节流通知（**绝不静默丢弃**）。选 inflight 计数而非固定速率窗口的原因：诊断单次耗时波动大（fan-out 多视角子会话），按「同时在跑几个」限才能守住 token 预算，速率窗口挡不住长耗时堆积
+- [x] P13-79 **诊断执行链**：`src/server/gateway/runner.ts` —— `AlertEnvelope.alert` → 复用 `src/server/session/factory.ts` 起独立 AgentSession（角色/env 取配置，缺省 ops/prod 只读口径）→ 组装诊断 prompt（含信封结构化信息：severity / fired_at / 原文 detail）→ 模型走 `fiat_alert_diagnosis`（或直接调 `diagnosisPlan` + `runFanout`，实现时按子会话工具注册口径二选一，**不改 plan/fanout 纯函数**）→ `renderReport()` 出报告 → 回写 `diagnosis_session_id`
+- [x] P13-80 **Lark 回推**：复用 `fiat_lark_send` 既有通道把报告卡发值班群；P0 附审批提示（若诊断建议含写操作，指引走 `approve/reject` 工单流，网关**绝不直接执行写**）
+- [x] P13-81 **CLI 与测试**：`fiat gateway`（启动常驻进程，前台跑，daemonize 不做）/ `fiat gateway status`；测试 `test/gateway-server.test.ts`（鉴权 / 4xx / 体积上限）、`gateway-store.test.ts`（fingerprint 幂等 / resolved 闭环）、`gateway-policy.test.ts`（分级 / 限流纯函数分支）、`gateway-e2e.test.ts`（curl 模拟推送 → stub Lark → 断言落库与诊断触发，模型层用 faux provider）；同步 `workspace/AGENTS.md` 工具清单与本节
+
+**阶段 13 硬约束（实现时不得破）**：
+
+1. 网关进程**不持模型凭据以外的新权限面**：诊断走既有三道闸门（角色谓词 / 策略引擎 / 审计），与 chat 同一套实现，不出现第二套权限。
+2. hook token 独立配置，不复用网关/模型/审批任何既有 token；仅 loopback bind，要暴露给告警平台须经 reverse proxy（文档注明，不做内建 TLS）。
+3. `AlertInput` 4 字段契约不动；结构化字段只存在于 `AlertEnvelope` 与 `fiat_alert_event`。
+4. 网关对诊断子会话**只有编排权**：拆视角、聚合、报告全部复用 `diagnosis/{plan,fanout}.ts`；不做「网关版简化诊断」。
+5. 写操作零例外走工单：网关链路里任何环节都不直接执行 L3+ 工具。
+6. 告警风暴防护是硬需求：fingerprint 去重 + severity 分级 + inflight 限流三者缺一不可，缺省全开。
+
 ---
 
 ## 9. 约束与踩坑

@@ -52,7 +52,16 @@ Agent 的能力由「内建扩展 + 工具模块」提供，随 pi-host 内嵌�
 - **评测准入**：落盘后跑 `config/eval_cases.yaml` 对应 case，`score` 低于阈值 → 自动 rollback 并标 `stale`；通过才把 `verified_by {case_id, score, verified_at}` 回写 SKILL.md。**只有 `score` 存在才算已验证**。
 - **维护**：`fiat skills list / curate / pin / unpin / archive / restore / rollback`（确定性状态机 `active → stale(30d) → archived(90d)`，`pin` 豁免）。
 
-**人写锚点，自进化只读**：本文件（`AGENTS.md`）、`config/tool_policies.yaml`、`config/eval_cases.yaml`、`config/evolution.yaml`。模型只能改技能库与 `workspace/memory/`。
+## 告警 webhook 网关（阶段 13，`fiat gateway`）
+
+常驻进程接收告警平台推送，入口 `POST /hooks/alert`（Bearer token 鉴权；**query string 传 token 一律拒绝**）+ `GET /healthz`。只做「收、验、存、派」四件确定性的事，诊断逻辑一行不写：
+
+- **fingerprint 幂等**：平台自带 dedup 键透传，否则 `sha256(source|alertName|service|sorted(labels))`（不含时间戳 / 实例 / 计数值）。同指纹且 firing 未恢复 → 只更 `last_seen_at` 不重复诊断；severity **升级**（如 P2→P0）视为新事件重新诊断；`resolved` 推送闭环；firing 超过 `dedupe_ttl_minutes` 无后续推送 → `stale` 兜底。
+- **severity 分级**：由**告警平台**判定随 payload 传入，网关只映射归一（critical→P0 / error→P1 / warn→P2 / info→P3）；**缺省 / 未知一律降 P2**（保守，不误触发）。P0/P1 自动并行诊断（复用 `diagnosisPlan` / `runFanout` 纯函数链 + 三道闸门），P2/P3 落库 + Lark 摘要卡等人触发。
+- **限流（防告警风暴）**：per-service **inflight 计数**（非速率窗口——诊断耗时长且波动大）+ 有界等待队列（同指纹合并）+ 队列满标 `throttled` 留痕通知，**绝不静默丢弃**。
+- **安全口径**：hook token 独立配置（`config/gateway.yaml` 或 `FIAT_GATEWAY_TOKEN`，为空拒绝启动）、仅 loopback bind（暴露须走 reverse proxy）、`AlertInput` 4 字段契约不动（结构化字段只在 `AlertEnvelope` 信封层）、写操作零例外走工单。
+
+**人写锚点，自进化只读**：本文件（`AGENTS.md`）、`config/tool_policies.yaml`、`config/eval_cases.yaml`、`config/evolution.yaml`、`config/gateway.yaml`。模型只能改技能库与 `workspace/memory/`。
 
 ## 工具命名约定
 

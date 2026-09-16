@@ -1,0 +1,36 @@
+# 告警 webhook 网关配置（阶段 13 / P13-73）
+#
+# 设计依据：DEV_SPEC.md §8 阶段 13（参考 OpenClaw gateway hooks）。
+# 本文件是**人写的锚点**（与 tool_policies.yaml / evolution.yaml 同级）——
+# 网关只读它，永不写它。
+#
+# 缺省值本文件未给时取 src/server/gateway/types.ts 的 DEFAULT_GATEWAY_CONFIG。
+# 安全口径：token 是**独立 hook token**，不复用模型 / 审批 / 网关任何既有凭据；
+# 留空 = 网关拒绝启动（fail-fast）。
+
+gateway:
+  # HTTP 监听端口（GET /healthz 健康检查 + POST /hooks/alert 推送入口）
+  port: 18800
+  # 目前只支持 loopback；要暴露给告警平台须经 reverse proxy（硬约束 2，不做内建 TLS）
+  bind: loopback
+  # hook token：生产从这里读；测试 / 本地可用环境变量 FIAT_GATEWAY_TOKEN 覆盖
+  # token: "replace-with-dedicated-webhook-token"
+
+  # 自动触发并行诊断的级别（P13-78 分级派发）
+  auto_diagnose_severities: ["P0", "P1"]
+
+  # firing 超过该分钟数无后续推送 → stale（P13-77 兜底：平台丢了 resolved）
+  dedupe_ttl_minutes: 120
+
+  # 防告警风暴三件套（硬约束 6，缺省全开）：
+  #   per-service 同时在跑的诊断数上限（inflight 计数，非速率窗口——诊断耗时长且波动大）
+  max_inflight_per_service: 2
+  #   per-service 等待队列长度；队列满 → throttled 落库 + Lark 节流通知（绝不静默丢弃）
+  max_queue_per_service: 16
+
+  # 单请求体上限（字节）；超限 413
+  max_body_bytes: 65536
+
+  # webhook payload → AlertEnvelope 的适配器（adapters.ts 注册表键）
+  # 首版 generic-json：字段映射表驱动；接入 Prometheus Alertmanager 等再加专用适配器
+  adapter: generic-json

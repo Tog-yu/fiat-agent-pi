@@ -38,8 +38,10 @@ import { loadPolicies, policyToolName } from "../../../src/server/policy/engine.
 import type { SessionSubject } from "../../../src/server/session/factory.ts";
 import { allowedToolPredicate } from "../../../src/server/session/predicate.ts";
 import { type EvolutionWiring, makeChat } from "./chat.ts";
-import { type CliDeps, type DiagnosisInput, runCli } from "./index.ts";
+import { type CliDeps, type DiagnosisInput, type GatewayLauncher, runCli } from "./index.ts";
 import { createSkillOps } from "./skills.ts";
+
+const DEFAULT_GATEWAY_PATH = fileURLToPath(new URL("../../../config/gateway.yaml", import.meta.url));
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_CTX = 128_000;
@@ -103,6 +105,85 @@ function bootstrapCliDeps(): CliDeps {
 			evolution: evolutionWiring({ skillStore, memoryStore, proposals, evolutionConfig, auditClient }),
 		}),
 		skills: createSkillOps({ skills: skillStore, proposals, config: evolutionConfig }),
+		gateway: makeGateway(policiesPath, auditClient),
+	};
+}
+
+/**
+ * 阶段 13 / P13-81：`fiat gateway` 装配。
+ *
+ * 复用 makeDiagnose 的注入式诊断（FIAT_MODEL 未配置 → 只落库 + 通知，不自动诊断，
+ * 告警仍可用 —— 分级策略天然容忍 diagnose 缺失，见 gateway/runner.ts #dispatch）。
+ * Pi 运行时依赖仅网关命令动态 import，离线命令不受影响。
+ */
+function makeGateway(policiesPath: string, sharedAudit: AuditClient): GatewayLauncher {
+	return async (): Promise<number> => {
+		const { loadGatewayConfig } = await import("../gateway/config.ts");
+		const { InMemoryAlertEventStore } = await import("../gateway/store.ts");
+		const { inflightGateFromConfig } = await import("../gateway/policy.ts");
+		const { GatewayServer } = await import("../gateway/server.ts");
+		const { LocalAlertNotifier } = await import("../gateway/notify.ts");
+
+		const config = loadGatewayConfig(DEFAULT_GATEWAY_PATH);
+		// token 兜底：环境变量优先级高于配置文件（容器部署常见做法）
+		const token = process.env.FIAT_GATEWAY_TOKEN ?? config.token;
+		if (!token) {
+			throw new Error("网关 token 未配置：请在 config/gateway.yaml 设 gateway.token 或设置 FIAT_GATEWAY_TOKEN");
+		}
+		const effectiveConfig = { ...config, token };
+
+		// 诊断注入：FIAT_MODEL 已配置 → 复用 makeDiagnose（同一套三道闸门 + 审计）
+		const diagnoseImpl = makeDiagnose(policiesPath, sharedAudit);
+		const store = new InMemoryAlertEventStore();
+		const gate = inflightGateFromConfig(effectiveConfig);
+		const notify = new LocalAlertNotifier();
+
+		const server = new GatewayServer(
+			{
+				config: effectiveConfig,
+				store,
+				...(diagnoseImpl
+					? {
+							diagnose: async (envelope) => {
+								const sessionId = `gw-${envelope.fingerprint.slice(0, 8)}-${Date.now()}`;
+								const report = await diagnoseImpl({
+									title: envelope.alert.title,
+									...(envelope.alert.service ? { service: envelope.alert.service } : {}),
+									...(envelope.alert.window ? { window: envelope.alert.window } : {}),
+									...(envelope.alert.detail ? { detail: envelope.alert.detail } : {}),
+								});
+								return { sessionId, report };
+							},
+						}
+					: {}),
+				notify,
+				now: Date.now,
+			},
+			gate,
+		);
+
+		const httpServer = server.listen();
+		await new Promise<void>((resolve, reject) => {
+			httpServer.once("listening", resolve);
+			httpServer.once("error", reject);
+		});
+		process.stderr.write(
+			`[gateway] 已启动 http://127.0.0.1:${effectiveConfig.port}/hooks/alert（${effectiveConfig.adapter}）\n` +
+				`[gateway] 自动诊断级别：${effectiveConfig.autoDiagnoseSeverities.join("/")}；` +
+				`模型：${diagnoseImpl ? process.env.FIAT_MODEL : "未配置（只落库 + 通知）"}\n` +
+				`[gateway] Ctrl+C 退出。\n`,
+		);
+
+		// 常驻：SIGINT/SIGTERM 优雅关闭
+		const stopped = new Promise<number>((resolve) => {
+			const shutdown = () => {
+				process.stderr.write("\n[gateway] 收到退出信号，关闭监听…\n");
+				httpServer.close(() => resolve(0));
+			};
+			process.once("SIGINT", shutdown);
+			process.once("SIGTERM", shutdown);
+		});
+		return stopped;
 	};
 }
 

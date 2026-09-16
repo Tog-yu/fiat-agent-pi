@@ -41,7 +41,15 @@ export interface CliDeps {
 	 * 缺省时该命令明确提示「技能库未配置」，而不是静默成功。
 	 */
 	skills?: SkillOps;
+	/**
+	 * 阶段 13 / P13-81：告警 webhook 网关（`fiat gateway`）。
+	 * 启动常驻进程并阻塞直至 SIGINT/SIGTERM；缺省时该命令明确提示。
+	 */
+	gateway?: GatewayLauncher;
 }
+
+/** 网关启动器：起 HTTP 服务并阻塞；返回进程退出码 */
+export type GatewayLauncher = (opts: { verbose: boolean }) => Promise<number>;
 
 export interface CliIo {
 	out: (s: string) => void;
@@ -74,6 +82,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps, io: CliIo):
 			return cmdTools(flags, deps, io);
 		case "skills":
 			return cmdSkills(positional, flags, deps, io);
+		case "gateway":
+			return cmdGateway(flags, deps, io);
 		default:
 			io.err(`未知命令：${command}\n\n${HELP}`);
 			return 1;
@@ -322,4 +332,21 @@ async function cmdSkills(
 
 function errText(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * 阶段 13 / P13-81：`fiat gateway` —— 常驻 webhook 网关。
+ * 前台跑（daemonize 不做，DEV_SPEC 阶段 13）；SIGINT/SIGTERM 优雅退出。
+ */
+async function cmdGateway(flags: Record<string, string>, deps: CliDeps, io: CliIo): Promise<number> {
+	if (!deps.gateway) {
+		io.err("网关未配置：gateway 需要 config/gateway.yaml（含 token）与 FIAT_MODEL（自动诊断）。");
+		return 1;
+	}
+	try {
+		return await deps.gateway({ verbose: flags.verbose === "true" });
+	} catch (e) {
+		io.err(`网关启动失败：${errText(e)}`);
+		return 1;
+	}
 }
