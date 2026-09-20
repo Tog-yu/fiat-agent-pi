@@ -15,6 +15,7 @@
  */
 
 import type { AlertInput } from "../diagnosis/plan.ts";
+import type { Tracer, TracingWiring } from "../tracing/types.ts";
 
 /** 归一化后的告警级别（P0 最高） */
 export type AlertSeverity = "P0" | "P1" | "P2" | "P3";
@@ -111,9 +112,17 @@ export interface GatewayDeps {
 	/** 幂等与持久化（P13-77 store.ts） */
 	store: AlertEventStore;
 	/** 自动诊断执行器（P13-79 runner 接线；缺省 = 仅落库 + 通知，便于离线测试） */
-	diagnose?: (input: AlertEnvelope) => Promise<{ sessionId: string; report: string }>;
+	diagnose?: (input: AlertEnvelope, tracing?: TracingWiring) => Promise<{ sessionId: string; report: string }>;
 	/** 回推通道（P13-80 notify.ts；测试注入 stub 收集调用） */
 	notify: AlertNotifier;
+	/**
+	 * 阶段 14（P14-89）：追踪器。**缺省 undefined = 不开**。
+	 *
+	 * 传 `Tracer` 而不是 `TracingWiring`：网关是**长驻进程**，「一条告警」才是链路边界，
+	 * 所以 trace 必须在 `handleAlert` 里**每条现开**——这与 chat（一个进程一个会话、wiring 固定）
+	 * 是不同的生命周期，用同一种入参会把两种语义搅在一起。
+	 */
+	tracer?: Tracer;
 	/** 时钟注入 */
 	now?: () => number;
 	/** 诊断结束回调（回收 inflight 计数在 runner 内部做，这里供测试断言） */

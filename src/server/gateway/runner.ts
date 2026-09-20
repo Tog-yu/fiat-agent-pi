@@ -17,6 +17,8 @@
  *      → stale（平台丢 resolved 的场景），此后同指纹再来按新事件处理。
  */
 
+import { LANGFUSE_KEYS, OBS_TYPE } from "../tracing/otlp.ts";
+import type { SpanHandle, TraceContext, Tracer, TracingWiring } from "../tracing/types.ts";
 import { classify } from "./policy.ts";
 import type {
 	AlertEnvelope,
@@ -53,6 +55,7 @@ export class AlertGateway {
 	readonly #notify: GatewayDeps["notify"];
 	readonly #now: () => number;
 	readonly #onEvent?: (event: GatewayEvent) => void;
+	readonly #tracer?: Tracer;
 	#sweepCounter = 0;
 
 	constructor(deps: GatewayDeps) {
@@ -62,22 +65,86 @@ export class AlertGateway {
 		this.#notify = deps.notify;
 		this.#now = deps.now ?? Date.now;
 		this.#onEvent = deps.onEvent;
+		this.#tracer = deps.tracer;
 	}
 
 	#emit(event: GatewayEvent): void {
 		this.#onEvent?.(event);
 	}
 
+	/** 子 span 便利入口；未开追踪 / 未采样 → undefined（调用点用 `?.`） */
+	#span(
+		ctx: TraceContext | undefined,
+		root: SpanHandle | undefined,
+		name: string,
+		attrs: Record<string, string | number | boolean>,
+	): SpanHandle | undefined {
+		if (!ctx || !this.#tracer || !ctx.sampled) return undefined;
+		return this.#tracer.startSpan(ctx, name, {
+			kind: "internal",
+			...(root ? { parentSpanId: root.spanId } : {}),
+			attributes: { [LANGFUSE_KEYS.obsType]: OBS_TYPE.span, ...attrs },
+		});
+	}
+
 	/**
 	 * webhook 主入口：server.ts 鉴权 + 适配成功后调用。
 	 * 返回记录 + 派发去向（HTTP 层据此回 200/202）。
 	 * 抛错 = 适配层之外的问题（store 异常等），由 server 兜 500。
+	 *
+	 * 阶段 14（P14-89）：**一条告警 = 一条 trace**。根 span `fiat.alert.handle` 覆盖整条
+	 * 处理链（去重 → 分级 → 派发 → 诊断），诊断蜂群的每个视角都长在它下面。
 	 */
 	async handleAlert(env: AlertEnvelope): Promise<HandleAlertResult> {
+		const ctx = this.#tracer?.startTrace({
+			name: "fiat.alert.handle",
+			kind: "gateway",
+			// sessionId 用 fingerprint：同一条告警的重复推送/升级在 Langfuse 里聚成一组
+			sessionId: env.fingerprint,
+			userId: env.source,
+			extraTags: [env.severity, env.status],
+			metadata: {
+				fingerprint: env.fingerprint,
+				source: env.source,
+				severity: env.severity,
+				service: env.alert.service ?? "",
+			},
+		});
+		const root = ctx && this.#tracer ? this.#tracer.startRootSpan(ctx) : undefined;
+		root?.setInput(env);
+		try {
+			const result = await this.#handle(env, ctx, root);
+			root?.setAttribute("fiat.gateway.outcome", result.outcome);
+			root?.setAttribute("fiat.gateway.diagnosis_dispatched", result.diagnosisDispatched);
+			root?.setStatus("ok");
+			root?.setOutput({ outcome: result.outcome, diagnosisDispatched: result.diagnosisDispatched });
+			return result;
+		} catch (error) {
+			root?.setStatus("error", error instanceof Error ? error.message : String(error));
+			// 网关单请求异常不影响主监听（P13-74），但要留痕——否则 trace 列表里凭空少一条
+			throw error;
+		} finally {
+			root?.end();
+		}
+	}
+
+	async #handle(
+		env: AlertEnvelope,
+		ctx: TraceContext | undefined,
+		root: SpanHandle | undefined,
+	): Promise<HandleAlertResult> {
 		await this.#sweepStaleIfNeeded();
 
 		const ts = nowIso(this.#now);
+		const dedupe = this.#span(ctx, root, "fiat.alert.dedupe", {
+			"fiat.alert.fingerprint": env.fingerprint,
+			"fiat.alert.status": env.status,
+			"fiat.alert.severity": env.severity,
+		});
 		const active = await this.#store.findActive(env.fingerprint);
+		dedupe?.setAttribute("fiat.alert.dedupe_hit", active !== null);
+		dedupe?.setStatus("ok");
+		dedupe?.end();
 
 		// resolved：关闭活跃告警（无活跃记录也接受 —— 平台可能重复恢复）
 		if (env.status === "resolved") {
@@ -120,7 +187,7 @@ export class AlertGateway {
 					from: active.severity,
 					to: env.severity,
 				});
-				return this.#dispatch(escalated, env);
+				return this.#dispatch(escalated, env, ctx, root);
 			}
 			// 同级 / 降级：只更 last_seen_at，不重复诊断
 			const refreshed: AlertEventRecord = { ...active, lastSeenAt: ts };
@@ -141,12 +208,26 @@ export class AlertGateway {
 			throttledCount: 0,
 		};
 		await this.#store.insert(record);
-		return this.#dispatch(record, env);
+		return this.#dispatch(record, env, ctx, root);
 	}
 
 	/** 分级派发：manual_only → 摘要卡；auto_diagnose → 诊断（未注入 diagnose 则降级摘要卡） */
-	#dispatch(record: AlertEventRecord, env: AlertEnvelope): HandleAlertResult {
+	#dispatch(
+		record: AlertEventRecord,
+		env: AlertEnvelope,
+		ctx: TraceContext | undefined,
+		root: SpanHandle | undefined,
+	): HandleAlertResult {
 		const action = classify(env.severity, this.#config.autoDiagnoseSeverities);
+		// 分级是纯函数决策，单独出 span：排障时「为什么这条 P0 没自动诊断」第一个要看的
+		// 就是 classify 的入参（severity）与配置（autoDiagnoseSeverities 命中与否）
+		const cls = this.#span(ctx, root, "fiat.alert.classify", {
+			"fiat.alert.severity": env.severity,
+			"fiat.alert.action": action,
+			"fiat.gateway.diagnose_injected": Boolean(this.#diagnose),
+		});
+		cls?.setStatus("ok");
+		cls?.end();
 
 		if (action !== "auto_diagnose" || !this.#diagnose) {
 			this.#emit({ kind: "accepted", fingerprint: env.fingerprint, severity: env.severity, action: "manual_only" });
@@ -160,20 +241,39 @@ export class AlertGateway {
 		}
 
 		this.#emit({ kind: "accepted", fingerprint: env.fingerprint, severity: env.severity, action: "auto_diagnose" });
-		// 诊断后台跑：webhook 立即返回（告警平台有超时重试，同步跑会放大风暴）
-		void this.#runDiagnosis(record, env).catch(() => {});
+		// 诊断后台跑：webhook 立即返回（告警平台有超时重试，同步跑会放大风暴）。
+		// 注意这里**不关根 span**——根 span 由 handleAlert 的 finally 收口，而诊断是
+		// fire-and-forget 的后台任务，它的 span 挂在已关的根上仍是合法子节点（OTLP 允许后到的子 span）。
+		void this.#runDiagnosis(record, env, ctx, root).catch(() => {});
 		return { record, outcome: "accepted", diagnosisDispatched: true };
 	}
 
 	/** 执行一次诊断：P13-79 执行链 + 回写 + 通知。调用方保证异常被兜住。 */
-	async #runDiagnosis(record: AlertEventRecord, env: AlertEnvelope): Promise<void> {
+	async #runDiagnosis(
+		record: AlertEventRecord,
+		env: AlertEnvelope,
+		ctx: TraceContext | undefined,
+		root: SpanHandle | undefined,
+	): Promise<void> {
 		if (!this.#diagnose) return; // 调用方 #dispatch 已保证 diagnose 存在；防御双保险
 		const diagnose = this.#diagnose;
+		const span = this.#span(ctx, root, "fiat.alert.diagnose", {
+			"fiat.alert.fingerprint": env.fingerprint,
+			"fiat.alert.severity": env.severity,
+		});
+		// 把**同一条 trace 的 ctx** 交给诊断执行链：蜂群的每个视角都挂在这条 trace 下
+		const wiring: TracingWiring | undefined =
+			ctx && this.#tracer
+				? { tracer: this.#tracer, trace: ctx, ...(root ? { parentSpanId: root.spanId } : {}) }
+				: undefined;
 		try {
-			const { sessionId, report } = await diagnose(env);
+			const { sessionId, report } = await diagnose(env, wiring);
 			const ts = nowIso(this.#now);
 			await this.#store.update({ ...record, diagnosisSessionId: sessionId, lastDiagnosisAt: ts });
 			this.#emit({ kind: "diagnosis_done", fingerprint: env.fingerprint, sessionId });
+			span?.setAttribute("fiat.diagnosis.session_id", sessionId);
+			span?.setOutput(report);
+			span?.setStatus("ok");
 			const header = `[${env.severity}] ${env.alert.title}\n诊断会话 ${sessionId}\n---\n`;
 			void this.#notify.send({
 				kind: "report",
@@ -183,6 +283,7 @@ export class AlertGateway {
 				report,
 			});
 		} catch (e) {
+			span?.setStatus("error", e instanceof Error ? e.message : String(e));
 			this.#emit({
 				kind: "diagnosis_failed",
 				fingerprint: env.fingerprint,
@@ -196,6 +297,8 @@ export class AlertGateway {
 				text: `[${env.severity}] ${env.alert.title}\n自动诊断失败，请人工介入。`,
 			});
 			throw e; // 交给调用方 catch(() => {}) 兜底；事件已 emit
+		} finally {
+			span?.end();
 		}
 	}
 

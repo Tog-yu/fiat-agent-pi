@@ -15,8 +15,10 @@
 
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { bridgeAgentHooks, setupEmbeddedExtensions } from "../host/extensions.ts";
+import { bridgeAgentHooks, bridgeLifecycleEvents, setupEmbeddedExtensions } from "../host/extensions.ts";
 import { PiHostLoop } from "../host/loop.ts";
+import { LANGFUSE_KEYS, OBS_TYPE } from "../tracing/otlp.ts";
+import type { TracingWiring } from "../tracing/types.ts";
 import type { RunOne } from "./fanout.ts";
 import type { DiagnosisTask } from "./plan.ts";
 
@@ -27,10 +29,21 @@ export interface ChildSessionBundle {
 	tools?: import("../host/tools.ts").HostTool[];
 	/** P8-37 L1a 钩子通道：编译期注入的内建 extension 工厂（permission-gate / audit-hook / model-router） */
 	extensionFactories?: Array<(pi: ExtensionAPI) => void>;
+	/**
+	 * 阶段 14（P14-88）：子会话的追踪接线（已带上视角 span 作 `parentSpanId`）。
+	 * 不传 = 这个视角不进 trace（追踪已关）。
+	 */
+	tracing?: TracingWiring;
 }
 
-/** 按视角构造子会话：视角的 tools 应在此收敛为只读子集（组合根 async，允许 Promise） */
-export type BuildChildSession = (task: DiagnosisTask) => ChildSessionBundle | Promise<ChildSessionBundle>;
+/**
+ * 按视角构造子会话：视角的 tools 应在此收敛为只读子集（组合根 async，允许 Promise）。
+ * 第二参 `tracing` 由 sessionRunner 现造（含视角 span 作父），组合根原样喂给 `buildSession`。
+ */
+export type BuildChildSession = (
+	task: DiagnosisTask,
+	tracing?: TracingWiring,
+) => ChildSessionBundle | Promise<ChildSessionBundle>;
 
 export interface DiagnosisRunnerDeps {
 	buildChildSession: BuildChildSession;
@@ -39,31 +52,76 @@ export interface DiagnosisRunnerDeps {
 	getApiKey?: (provider: string) => string | undefined;
 	cwd: string;
 	agentDir: string;
+	/**
+	 * 阶段 14（P14-88）：蜂群视角的父 trace。**必传同一个 `TraceContext`**——
+	 * 每个视角的 span 都挂在这条 trace 的 `fiat.fanout.angle` 下，
+	 * 于是「一条告警 → N 个视角 → 各自的 generation/tool」在 Langfuse 里是**一棵树**。
+	 */
+	tracing?: TracingWiring;
 }
 
 export function createDiagnosisRunner(deps: DiagnosisRunnerDeps): RunOne {
 	return async (task: DiagnosisTask) => {
-		const bundle = await deps.buildChildSession(task);
-
-		const { runner } = await setupEmbeddedExtensions({
-			cwd: deps.cwd,
-			agentDir: deps.agentDir,
-			factories: bundle.extensionFactories ?? [],
-		});
-
-		const host = new PiHostLoop({
-			model: deps.model,
-			getApiKey: deps.getApiKey,
-			sessionId: bundle.sessionId,
-			tools: bundle.tools ?? [],
-			...bridgeAgentHooks(runner),
-		});
+		// 视角 span：整个视角（含子会话的 LLM 轮 + 工具调用）都长在它下面
+		const angleSpan =
+			deps.tracing?.trace.sampled === true
+				? deps.tracing.tracer.startSpan(deps.tracing.trace, "fiat.fanout.angle", {
+						kind: "internal",
+						...(deps.tracing.parentSpanId ? { parentSpanId: deps.tracing.parentSpanId } : {}),
+						attributes: {
+							[LANGFUSE_KEYS.obsType]: OBS_TYPE.agent,
+							"fiat.diagnosis.angle": task.name,
+							"fiat.diagnosis.tools": task.tools,
+						},
+					})
+				: undefined;
+		// 子会话的默认父 = 视角 span（而不是主 trace 的根），这才叫"挂同一棵树"
+		const childTracing: TracingWiring | undefined =
+			deps.tracing && angleSpan
+				? { tracer: deps.tracing.tracer, trace: deps.tracing.trace, parentSpanId: angleSpan.spanId }
+				: deps.tracing;
 
 		try {
-			const r = await host.runTurnSafe(task.prompt);
-			return r.ok ? r.reply : `（视角执行失败：${r.error}）`;
+			const bundle = await deps.buildChildSession(task, childTracing);
+
+			const { runner } = await setupEmbeddedExtensions({
+				cwd: deps.cwd,
+				agentDir: deps.agentDir,
+				factories: bundle.extensionFactories ?? [],
+			});
+
+			const host = new PiHostLoop({
+				model: deps.model,
+				getApiKey: deps.getApiKey,
+				sessionId: bundle.sessionId,
+				tools: bundle.tools ?? [],
+				...(bundle.tracing ? { tracing: bundle.tracing } : {}),
+				...bridgeAgentHooks(runner),
+			});
+
+			// 阶段 14（P14-88）：`turn_start` / `turn_end` **只经 `Agent.subscribe()` 扇出**，
+			// 不在 `bridgeAgentHooks` 里（见 host/extensions.ts 的说明）。不订的话，子会话的
+			// `fiat.llm.turn` generation 与「被拦调用对账」两件事一个都不会发生——
+			// trace 上只剩 tool span，恰好丢掉的又正是「这个视角烧了多少 token」。
+			const unsub = bundle.tracing ? bridgeLifecycleEvents(host.agent, runner) : undefined;
+
+			try {
+				const r = await host.runTurnSafe(task.prompt);
+				const reply = r.ok ? r.reply : `（视角执行失败：${r.error}）`;
+				if (!r.ok) angleSpan?.setStatus("error", r.error);
+				else angleSpan?.setStatus("ok");
+				angleSpan?.setOutput(reply);
+				return reply;
+			} finally {
+				unsub?.();
+			}
+		} catch (error) {
+			angleSpan?.setStatus("error", error instanceof Error ? error.message : String(error));
+			throw error;
 		} finally {
-			// inMemory 会话随 Agent 释放；无持久化句柄需要显式 dispose
+			// inMemory 会话随 Agent 释放；无持久化句柄需要显式 dispose。
+			// 视角 span 在这里收口——异常路径也要关，否则树上留洞。
+			angleSpan?.end();
 		}
 	};
 }

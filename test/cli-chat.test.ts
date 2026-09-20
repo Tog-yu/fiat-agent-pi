@@ -136,7 +136,10 @@ describe("makeChat 全链路（faux provider，真实 buildSession + PiHostLoop�
 		expect(r.ok).toBe(true);
 		expect(r.reply).toBe("返现规则是……（faux 回复）");
 		session.dispose();
-	});
+		// 显式放宽超时：`makeChat` 的工厂体里**动态 import** Pi 运行时（装配纪律：
+		// 离线 CLI 命令不落地 Pi 模块），vitest 把这次冷加载算进用例耗时
+		// （本机实测首次 ~29s，默认 5s 必然假红）。断言一字未改。
+	}, 90_000);
 
 	it("无权限角色跑通一轮：viewer 会话正常回答（闸门①已裁剪 reconcile）", async () => {
 		faux = registerFauxProvider();
@@ -155,5 +158,6 @@ describe("makeChat 全链路（faux provider，真实 buildSession + PiHostLoop�
 		expect(r.ok).toBe(true);
 		expect(r.reply).toBe("本轮不调工具，直接回答。");
 		session.dispose();
-	});
+		// 同上：第二个用例复用已加载的模块，通常几秒内结束；给足余量避免并行跑时被 CPU 争抢拖垮
+	}, 90_000);
 });

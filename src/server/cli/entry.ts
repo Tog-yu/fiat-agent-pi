@@ -37,7 +37,12 @@ import { LocalPolicyClient, type PolicyClient } from "../../../src/server/policy
 import { loadPolicies, policyToolName } from "../../../src/server/policy/engine.ts";
 import type { SessionSubject } from "../../../src/server/session/factory.ts";
 import { allowedToolPredicate } from "../../../src/server/session/predicate.ts";
+import { createTracingClient, type TracingClient } from "../../../src/server/tracing/client.ts";
+import { loadTracingConfig, resolveTracingCredentials } from "../../../src/server/tracing/config.ts";
+import { createTracer } from "../../../src/server/tracing/tracer.ts";
+import type { Tracer, TracingConfig, TracingWiring } from "../../../src/server/tracing/types.ts";
 import { type EvolutionWiring, makeChat } from "./chat.ts";
+import type { TraceStatus } from "./commands.ts";
 import { type CliDeps, type DiagnosisInput, type GatewayLauncher, runCli } from "./index.ts";
 import { createSkillOps } from "./skills.ts";
 
@@ -53,6 +58,8 @@ const DEFAULT_POLICIES_PATH = fileURLToPath(new URL("../../../config/tool_polici
 const DEFAULT_MODEL_POLICIES_PATH = fileURLToPath(new URL("../../../config/model_policies.yaml", import.meta.url));
 const DEFAULT_EVOLUTION_PATH = fileURLToPath(new URL("../../../config/evolution.yaml", import.meta.url));
 const DEFAULT_EVAL_CASES_PATH = fileURLToPath(new URL("../../../config/eval_cases.yaml", import.meta.url));
+/** 阶段 14：追踪配置（人写锚点；`enabled` 缺省 false，关时零网络零定时器） */
+const DEFAULT_TRACING_PATH = fileURLToPath(new URL("../../../config/tracing.yaml", import.meta.url));
 /** 技能库 / 记忆目录的宿主根（与 chat 的 cwd 同一处） */
 const WORKSPACE_DIR = fileURLToPath(new URL("../../../workspace", import.meta.url));
 
@@ -62,10 +69,48 @@ function cliSubject(): SessionSubject {
 	return { user: { id: "cli", role }, environment: env };
 }
 
+/** 阶段 14：进程级追踪三件套（配置 / 上报 client / tracer），全进程共用一份 */
+interface CliTracing {
+	cfg: TracingConfig;
+	client: TracingClient;
+	tracer: Tracer;
+}
+
+/**
+ * 阶段 14（P14-89）：装配全链路追踪。
+ *
+ * 三个口径：
+ *   1. **缺省关**：`config/tracing.yaml` 的 `enabled` 缺省 false → `NoopTracingClient`，
+ *      零网络、零定时器、零行为变化（现有测试零改动）。
+ *   2. **fail-fast**：文件里写了 `enabled: true` 但环境变量没有 pk/sk → `loadTracingConfig`
+ *      直接抛，进程起不来。这是刻意选的——「追踪配错但悄悄不工作」比「起不来」难查得多。
+ *   3. **只在这里读一次**：CLI 的九个子命令共用同一个 client，队列与丢弃计数因此是全局的
+ *      （`fiat trace status` 报的就是它）。
+ */
+function bootstrapTracing(): CliTracing {
+	const cfg = loadTracingConfig(DEFAULT_TRACING_PATH);
+	const client = createTracingClient(cfg);
+	return { cfg, client, tracer: createTracer(cfg, client) };
+}
+
+/** `fiat trace status` 的载荷。**零网络**：只看本地配置与进程内计数（见 commands.ts）。 */
+function buildTraceStatus(t: CliTracing): TraceStatus {
+	return {
+		enabled: t.cfg.enabled,
+		endpoint: t.cfg.endpoint,
+		serviceName: t.cfg.serviceName,
+		captureContent: t.cfg.captureContent,
+		credentials: resolveTracingCredentials(t.cfg) !== undefined,
+		stats: t.client.stats(),
+	};
+}
+
 /** 组装 CLI 依赖（全部真实服务，零网络；PG 实现留作 L2 挂载时替换） */
-function bootstrapCliDeps(): CliDeps {
+function bootstrapCliDeps(): { deps: CliDeps; tracing: CliTracing } {
 	const policiesPath = DEFAULT_POLICIES_PATH;
 	const policies = loadPolicies(policiesPath);
+	// 阶段 14：追踪在**装配最开始**建好——它要么被各命令注入，要么完全关着（Noop）
+	const tracing = bootstrapTracing();
 	const auditClient: AuditClient = new InMemoryAuditClient();
 	const audit = new InMemoryAuditReader(() => auditClient.entries?.() ?? []);
 	const ticketStore: TicketStore = new InMemoryTicketStore();
@@ -93,19 +138,25 @@ function bootstrapCliDeps(): CliDeps {
 	const evolutionConfig = loadEvolutionConfig(DEFAULT_EVOLUTION_PATH);
 
 	return {
-		policies,
-		audit,
-		listTickets: () => approval.list(),
-		approveTicket: (id) => approval.approve(id),
-		rejectTicket: (id, reason) => approval.reject(id, reason),
-		diagnose: makeDiagnose(policiesPath, auditClient),
-		chat: makeChat({
-			policiesPath,
-			auditClient,
-			evolution: evolutionWiring({ skillStore, memoryStore, proposals, evolutionConfig, auditClient }),
-		}),
-		skills: createSkillOps({ skills: skillStore, proposals, config: evolutionConfig }),
-		gateway: makeGateway(policiesPath, auditClient),
+		deps: {
+			policies,
+			audit,
+			listTickets: () => approval.list(),
+			approveTicket: (id) => approval.approve(id),
+			rejectTicket: (id, reason) => approval.reject(id, reason),
+			diagnose: makeDiagnose(policiesPath, auditClient, tracing.tracer),
+			chat: makeChat({
+				policiesPath,
+				auditClient,
+				// 阶段 14：chat 是「一轮用户输入 = 一条 trace」，所以给的是 tracer 而不是固定 wiring
+				tracing: tracing.tracer,
+				evolution: evolutionWiring({ skillStore, memoryStore, proposals, evolutionConfig, auditClient }),
+			}),
+			skills: createSkillOps({ skills: skillStore, proposals, config: evolutionConfig }),
+			gateway: makeGateway(policiesPath, auditClient, tracing),
+			trace: () => buildTraceStatus(tracing),
+		},
+		tracing,
 	};
 }
 
@@ -115,8 +166,11 @@ function bootstrapCliDeps(): CliDeps {
  * 复用 makeDiagnose 的注入式诊断（FIAT_MODEL 未配置 → 只落库 + 通知，不自动诊断，
  * 告警仍可用 —— 分级策略天然容忍 diagnose 缺失，见 gateway/runner.ts #dispatch）。
  * Pi 运行时依赖仅网关命令动态 import，离线命令不受影响。
+ *
+ * 阶段 14（P14-89）：网关是**长驻进程**，链路边界是「一条告警」而不是进程 ——
+ * 所以注入的是 `Tracer`，trace 由 `handleAlert` 每条现开（见 gateway/types.ts 的 GatewayDeps.tracer）。
  */
-function makeGateway(policiesPath: string, sharedAudit: AuditClient): GatewayLauncher {
+function makeGateway(policiesPath: string, sharedAudit: AuditClient, tracing: CliTracing): GatewayLauncher {
 	return async (): Promise<number> => {
 		const { loadGatewayConfig } = await import("../gateway/config.ts");
 		const { InMemoryAlertEventStore } = await import("../gateway/store.ts");
@@ -132,8 +186,10 @@ function makeGateway(policiesPath: string, sharedAudit: AuditClient): GatewayLau
 		}
 		const effectiveConfig = { ...config, token };
 
-		// 诊断注入：FIAT_MODEL 已配置 → 复用 makeDiagnose（同一套三道闸门 + 审计）
-		const diagnoseImpl = makeDiagnose(policiesPath, sharedAudit);
+		// 诊断注入：FIAT_MODEL 已配置 → 复用 makeDiagnose（同一套三道闸门 + 审计）。
+		// 第二参 `wiring` 是**同一条 alert trace** 的接线：蜂群的每个视角都挂在它下面，
+		// 而不是各自另开 trace（硬约束 8）。
+		const diagnoseImpl = makeDiagnose(policiesPath, sharedAudit, tracing.tracer);
 		const store = new InMemoryAlertEventStore();
 		const gate = inflightGateFromConfig(effectiveConfig);
 		const notify = new LocalAlertNotifier();
@@ -144,20 +200,25 @@ function makeGateway(policiesPath: string, sharedAudit: AuditClient): GatewayLau
 				store,
 				...(diagnoseImpl
 					? {
-							diagnose: async (envelope) => {
+							diagnose: async (envelope, wiring) => {
 								const sessionId = `gw-${envelope.fingerprint.slice(0, 8)}-${Date.now()}`;
-								const report = await diagnoseImpl({
-									title: envelope.alert.title,
-									...(envelope.alert.service ? { service: envelope.alert.service } : {}),
-									...(envelope.alert.window ? { window: envelope.alert.window } : {}),
-									...(envelope.alert.detail ? { detail: envelope.alert.detail } : {}),
-								});
+								const report = await diagnoseImpl(
+									{
+										title: envelope.alert.title,
+										...(envelope.alert.service ? { service: envelope.alert.service } : {}),
+										...(envelope.alert.window ? { window: envelope.alert.window } : {}),
+										...(envelope.alert.detail ? { detail: envelope.alert.detail } : {}),
+									},
+									wiring,
+								);
 								return { sessionId, report };
 							},
 						}
 					: {}),
 				notify,
 				now: Date.now,
+				// 关追踪时不注入：`handleAlert` 里 `this.#tracer` 为 undefined → 整条链路跳过 span 分配
+				...(tracing.tracer.enabled ? { tracer: tracing.tracer } : {}),
 			},
 			gate,
 		);
@@ -178,7 +239,11 @@ function makeGateway(policiesPath: string, sharedAudit: AuditClient): GatewayLau
 		const stopped = new Promise<number>((resolve) => {
 			const shutdown = () => {
 				process.stderr.write("\n[gateway] 收到退出信号，关闭监听…\n");
-				httpServer.close(() => resolve(0));
+				httpServer.close(() => {
+					// 阶段 14：先把待发 span 冲出去再退出 —— 定时器 unref 过，不显式 flush 会丢最后一批
+					// （而最后一批恰好是「正在诊断时被 Ctrl+C」的那条告警，最不该丢）。
+					void tracing.client.shutdown().finally(() => resolve(0));
+				});
 			};
 			process.once("SIGINT", shutdown);
 			process.once("SIGTERM", shutdown);
@@ -243,8 +308,13 @@ function evolutionWiring(args: {
  * 注意：Pi 运行时依赖（AuthStorage / ModelRegistry / sessionRunner）仅在真正诊断时
  * 动态 import，离线命令（audit / tickets / approve / tools / help）永不着陆这些模块，
  * 因此可在零依赖 Node 下直接跑，无需先 build 本地 Pi 的 dist。
+ *
+ * 阶段 14（P14-89）：返回的函数多接一个**可选** `tracing` 参数 ——
+ *   - 传了（gateway 路径）→ 用**调用方那条 trace**（`fiat.alert.handle` 的根），蜂群挂同一棵树；
+ *   - 没传（`fiat diagnose` 命令行路径）→ 自己开一条 `fiat.diagnose` 作根，同样是完整一棵树。
+ * 两条路径共用同一段 fan-out 代码，差别只在"根 span 谁开"。
  */
-function makeDiagnose(policiesPath: string, sharedAudit: AuditClient) {
+function makeDiagnose(policiesPath: string, sharedAudit: AuditClient, tracer?: Tracer) {
 	const fiatModel = process.env.FIAT_MODEL;
 	if (!fiatModel) return undefined;
 
@@ -260,12 +330,36 @@ function makeDiagnose(policiesPath: string, sharedAudit: AuditClient) {
 	const cfg = modelPolicies.providers?.[provider];
 	if (!cfg) throw new Error(`FIAT_MODEL 指定的 provider "${provider}" 不在 config/model_policies.yaml`);
 
-	return async (input: DiagnosisInput): Promise<string> => {
+	return async (input: DiagnosisInput, tracing?: TracingWiring): Promise<string> => {
 		// —— Pi 运行时依赖：仅诊断路径动态加载，离线命令不触发 ——
 		const { AuthStorage, getAgentDir, ModelRegistry } = await import("@earendil-works/pi-coding-agent");
 		const { registryResolver } = await import("../host/l1a/model-router.ts");
 		const { createDiagnosisRunner } = await import("../../../src/server/diagnosis/sessionRunner.ts");
 		const { buildSession } = await import("../../../src/server/session/factory.ts");
+
+		// 阶段 14：命令行路径（无外部接线）→ 自己开一条 trace 作根。
+		// 不这么做的话，每个视角的 `fiat.fanout.angle` 都会是"无父 span"，在 Langfuse 里
+		// 碎成 N 条互不相干的 trace —— 而「一条告警 → 5 个视角」本来就是要看一棵树。
+		const ownsTrace = tracing === undefined && tracer?.enabled === true;
+		const ownCtx =
+			ownsTrace && tracer
+				? tracer.startTrace({
+						name: "fiat.diagnose",
+						kind: "diagnose",
+						userId: "cli",
+						role: process.env.FIAT_ROLE ?? "ops",
+						environment: process.env.FIAT_ENV ?? "dev",
+						extraTags: ["cli"],
+						...(input.service ? { metadata: { service: input.service } } : {}),
+					})
+				: undefined;
+		const ownRoot = ownCtx && tracer ? tracer.startRootSpan(ownCtx) : undefined;
+		const effectiveTracing: TracingWiring | undefined = tracing
+			? tracing
+			: ownCtx && ownRoot && tracer
+				? { tracer, trace: ownCtx, parentSpanId: ownRoot.spanId }
+				: undefined;
+		ownRoot?.setInput(input);
 
 		const registry = ModelRegistry.inMemory(AuthStorage.inMemory());
 		registry.registerProvider(provider, {
@@ -294,15 +388,23 @@ function makeDiagnose(policiesPath: string, sharedAudit: AuditClient) {
 		const roleAllowed = allowedToolPredicate(policies, subject);
 
 		const runOne = createDiagnosisRunner({
-			buildChildSession: async (task) => {
+			buildChildSession: async (task, childTracing) => {
 				const r = await buildSession(subject, {
 					policiesPath,
 					auditClient: sharedAudit,
 					modelResolver: resolve,
 					// 子会话把工具收敛到单个视角的只读子集（registered name → logical 归一后比对）
 					toolFilter: (registeredName) => task.tools.includes(policyToolName(registeredName)),
+					// 阶段 14：视角 span 作父 —— 子会话的 fiat.turn / generation / tool 全挂它下面
+					...(childTracing ? { tracing: childTracing } : {}),
 				});
-				return { extensionFactories: r.extensionFactories, tools: r.hostTools, sessionId: r.sessionId };
+				return {
+					extensionFactories: r.extensionFactories,
+					tools: r.hostTools,
+					sessionId: r.sessionId,
+					// 子会话宿主据此开 `fiat.turn` 根 span（视角 span 之下）
+					...(r.tracing ? { tracing: r.tracing } : {}),
+				};
 			},
 			model,
 			getApiKey: (p) => {
@@ -312,22 +414,38 @@ function makeDiagnose(policiesPath: string, sharedAudit: AuditClient) {
 			},
 			cwd: process.cwd(),
 			agentDir: getAgentDir(),
+			...(effectiveTracing ? { tracing: effectiveTracing } : {}),
 		});
 
 		const tasks = diagnosisPlan(input, { allowedTools: (logicalName) => roleAllowed(logicalName) });
-		const { results, summary } = await runFanout({ tasks, runOne });
-		return renderReport(input, results, summary);
+		try {
+			const { results, summary } = await runFanout({ tasks, runOne });
+			const report = renderReport(input, results, summary);
+			ownRoot?.setOutput(report);
+			ownRoot?.setStatus("ok");
+			ownRoot?.setAttribute("fiat.diagnosis.angles", results.length);
+			return report;
+		} catch (error) {
+			ownRoot?.setStatus("error", error instanceof Error ? error.message : String(error));
+			throw error;
+		} finally {
+			// 自开的根 span 自己收口（外部传进来的 wiring 由网关那张根 span 负责）
+			ownRoot?.end();
+		}
 	};
 }
 
 async function main(): Promise<void> {
 	const args = process.argv.slice(2);
-	const deps = bootstrapCliDeps();
+	const { deps, tracing } = bootstrapCliDeps();
 	try {
 		const code = await runCli(args, deps, {
 			out: (s) => process.stdout.write(`${s}\n`),
 			err: (s) => process.stderr.write(`${s}\n`),
 		});
+		// 阶段 14（P14-89）：退出前把待发 span 冲出去。上报定时器是 unref 过的
+		// （不能被它钉住进程），代价就是**不显式 flush 会丢最后一批** —— 那恰好是本次命令的收尾链路。
+		await tracing.client.shutdown();
 		process.exit(code);
 	} catch (e) {
 		process.stderr.write(`CLI 启动失败：${e instanceof Error ? e.message : String(e)}\n`);

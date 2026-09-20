@@ -35,6 +35,7 @@ import { createEvalRecorder } from "../host/l1a/eval-recorder.ts";
 import type { EvolutionTrigger } from "../host/l1a/evolution-trigger.ts";
 import { createModelRouter, type ModelResolver, type RouteApplied } from "../host/l1a/model-router.ts";
 import { createPermissionGate } from "../host/l1a/permission-gate.ts";
+import { createTraceHook } from "../host/l1a/trace-hook.ts";
 import { createAlertFanout } from "../host/l1b/alert-fanout.ts";
 import { createFiatTools } from "../host/l1b/fiat-tools.ts";
 import { createJobApply } from "../host/l1b/job-apply.ts";
@@ -43,6 +44,8 @@ import { createSkillTools } from "../host/l1b/skill-tools.ts";
 import { loadModelPolicies, type ModelPolicies } from "../models/router.ts";
 import { LocalPolicyClient, type PolicyClient } from "../policy/client.ts";
 import { loadPolicies, type ToolPolicy } from "../policy/engine.ts";
+import { tracedPolicyClient } from "../tracing/decorators.ts";
+import { resolveTracing, type TracingSource, type TracingWiring } from "../tracing/types.ts";
 
 export interface SessionSubject {
 	user: { id: string; role: string };
@@ -117,6 +120,19 @@ export interface SessionFactoryOptions {
 		/** 注入的「近期事实」条数 / 字数上限（缺省用 memoryStore 的默认双截断） */
 		memoryDays?: number;
 	};
+	/**
+	 * 阶段 14（P14-87）：全链路追踪。**缺省 undefined = 完全不开**（走 Noop，零开销）。
+	 *
+	 * 收**取值器**（`TracingWiring` 或 `() => TracingWiring | undefined`），不是固定 wiring：
+	 * chat 的语义是「一轮 = 一条 trace」，而本组合根跑在**首轮之前**，此后闸门③ / 工单 / MCP
+	 * 都发生在某一轮之内——它们必须以「调用那一刻」的接线为准（见 tracing/types.ts）。
+	 *
+	 * 传入后本组合根会做三件事：
+	 *   ① 用 `tracedPolicyClient` 包住 policyClient → 闸门③ `canExecute` 出 `fiat.gate.can_execute` span
+	 *   ② 尾部追加 L1a `trace-hook`（generation / tool 子 span + 首轮补登 `fiat.gate.build`）
+	 *   ③ 把构建事实（角色 / 环境 / 注册工具数）交给 trace-hook 延迟落 span
+	 */
+	tracing?: TracingSource;
 }
 
 export interface SessionFactoryResult {
@@ -141,6 +157,15 @@ export interface SessionFactoryResult {
 	 * 即可保持与以前字节级一致（也为 prefix cache 保留了稳定性）。
 	 */
 	evolutionPrompt: string;
+	/**
+	 * 阶段 14（P14-87）：本次会话的追踪句柄（= 构建时刻取值器的求值结果）。
+	 * 入口层据此把**同一个 `TraceContext`** 交给 `PiHostLoop` 当根 span——两处必须同一个 ctx，
+	 * 否则子 span 会挂到根 id 之外，树裂开。
+	 *
+	 * 取值器是函数且此刻还没开始任何一轮时（chat 的 per-turn trace）→ undefined：
+	 * 那条路径由入口层用 `perTurnTracing` 直接给宿主，不经过这里。
+	 */
+	tracing?: TracingWiring;
 }
 
 /**
@@ -160,13 +185,17 @@ export async function buildSession(
 	subject: SessionSubject,
 	opts: SessionFactoryOptions,
 ): Promise<SessionFactoryResult> {
+	const startedMs = Date.now();
 	const policies = loadPolicies(opts.policiesPath);
 	const roleAllowed = allowedToolPredicate(policies, subject);
 	// P6-25：toolFilter 与角色谓词 AND —— 子会话据此把工具压到单个视角的只读子集
 	const allowedTools = opts.toolFilter
 		? (name: string) => roleAllowed(name) && (opts.toolFilter?.(name) ?? false)
 		: roleAllowed;
-	const policyClient = opts.policyClient ?? new LocalPolicyClient(opts.policiesPath);
+	const rawPolicyClient = opts.policyClient ?? new LocalPolicyClient(opts.policiesPath);
+	// 阶段 14（P14-87）：装饰而非改实现 —— `LocalPolicyClient` / `HttpPolicyClient` / 测试 mock
+	// 三种实现一次覆盖，且 `engine.ts` 的纯函数属性不被污染。
+	const policyClient = opts.tracing ? tracedPolicyClient(rawPolicyClient, opts.tracing) : rawPolicyClient;
 	const auditClient = opts.auditClient ?? new InMemoryAuditClient();
 	const ragConfig = opts.ragConfig ?? { transport: "stdio" };
 	const sessionId = opts.sessionId ?? randomUUID();
@@ -179,6 +208,8 @@ export async function buildSession(
 		clientFactory: opts.ragClientFactory,
 		allowedTools,
 		onStatus: opts.ragOnStatus,
+		// 阶段 14（P14-88）：MCP 一跳挂 tool span 之下（父 span 经 toolSpans 注册表解析）
+		...(opts.tracing ? { tracing: opts.tracing } : {}),
 	});
 
 	const gate = createPermissionGate({
@@ -209,6 +240,8 @@ export async function buildSession(
 		sha256: sha256Default,
 		tokenTtlMs: opts.tokenTtlMs ?? 30 * 60 * 1000,
 		sessionId,
+		// 阶段 14（P14-88）：工单生命周期 span（create / approve / reject / apply）
+		...(opts.tracing ? { tracing: opts.tracing } : {}),
 	});
 
 	const fiatTools = createFiatTools({
@@ -246,7 +279,7 @@ export async function buildSession(
 		);
 	}
 	// 阶段 12（P12-63）：evolution-trigger **尾部追加，不插队**。
-	// 位置契约：[gate, audit, modelRouter, ...evalRecorder?, ...evolutionTrigger?]
+	// 位置契约：[gate, audit, modelRouter, ...evalRecorder?, ...evolutionTrigger?, ...traceHook?]
 	if (opts.evolution?.trigger) factories.push(opts.evolution.trigger.factory);
 
 	const skillTools = opts.evolution ? createSkillTools({ store: opts.evolution.skillStore, allowedTools }) : [];
@@ -260,6 +293,27 @@ export async function buildSession(
 				...(opts.diagnosisConcurrency !== undefined ? { concurrency: opts.diagnosisConcurrency } : {}),
 				...(opts.diagnosisTimeoutMs !== undefined ? { timeoutMs: opts.diagnosisTimeoutMs } : {}),
 				...(opts.onDiagnosisTask ? { onTask: opts.onDiagnosisTask } : {}),
+			}),
+		);
+	}
+
+	// 阶段 14（P14-86/87）：trace-hook **尾部追加，不插队**（放在 hostTools 定稿之后，
+	// 因为构建事实要带上最终注册的工具名）。
+	// 放最后的另一个原因：它对 tool_call 的可见性依赖「闸门在前」——被闸门② block 的调用
+	// 会短路，trace-hook 因此收不到；那部分由 turn_end 对账补齐（见 trace-hook 文件头）。
+	if (opts.tracing) {
+		factories.push(
+			createTraceHook({
+				source: opts.tracing,
+				// 构建事实**延迟**到第一条 trace 的首轮才落 span：chat 是 per-turn trace，
+				// 而本函数跑在首轮之前——此刻没有 trace 可挂（详见 trace-hook 的 TraceBuildInfo）。
+				buildInfo: {
+					startedMs,
+					role: subject.user.role,
+					environment: subject.environment,
+					registeredTools: hostTools.map((t) => t.name),
+					policiesLoaded: policies.size,
+				},
 			}),
 		);
 	}
@@ -278,6 +332,10 @@ export async function buildSession(
 			})
 		: "";
 
+	// 阶段 14：把「构建时刻的接线」求值一次给调用方。函数形态的取值器此刻多半是 undefined
+	// （chat 是 per-turn trace，首轮还没开始）——那条路径由入口层用 `perTurnTracing` 自己给宿主。
+	const buildTimeTracing = resolveTracing(opts.tracing);
+
 	return {
 		policies,
 		allowedTools,
@@ -289,5 +347,6 @@ export async function buildSession(
 		extensionFactories: factories,
 		hostTools,
 		evolutionPrompt,
+		...(buildTimeTracing ? { tracing: buildTimeTracing } : {}),
 	};
 }

@@ -222,5 +222,205 @@ first_step  = 1 if 实际首工具 ∈ any_of else 0
 5. 写操作零例外走工单：网关链路里任何环节都不直接执行 L3+ 工具。
 6. 告警风暴防护是硬需求：fingerprint 去重 + severity 分级 + inflight 限流三者缺一不可，缺省全开。
 
+### 阶段 14：Langfuse 全链路追踪（一条执行链路 = 一条 trace，OTLP/HTTP）
+
+> 方向确认于 2026-09-20。触发背景：现有可观测面是**三张彼此不连通的网**——`fiat_audit_log` 记「每次工具调用」（只追加、面向合规追责）、`fiat_eval_*` 三表记「每轮轨迹」（面向离线重算）、`GatewayEvent` 只活在网关进程内存里。**没有任何一层能回答「这一次用户请求 / 这一条告警，从头到尾发生了什么、慢在哪、token 花在哪、被哪道闸门拦下」**：审计里看不到 LLM 轮次与 token，评测里看不到审批工单与蜂群诊断，网关事件流出了进程就没了。本阶段补上「一条执行链路 = 一条 trace」的**纵向视图**，并把 chat / diagnose / gateway / 评测 / 进化五种入口收进同一套 span 语义。
+
+验收：`tracing.enabled: true` 时——① `fiat chat` 跑一轮，本地 stub OTLP 端点收到 **1 个 OTLP/HTTP JSON 批次**：`traceId` 唯一、span 树闭合（每个 `parentSpanId` 都能追到根）、根 span 名 `fiat.turn`，其下至少 1 个 `generation`（带 `gen_ai.request.model` + `langfuse.observation.usage_details`）与 N 个 `tool` 子 span（`mcp_rag_*` 之下还有 `fiat.mcp.call`）；② **闸门② block 的工具仍然出 span**（`fiat.gate.tool_call="block"`、`langfuse.observation.level=WARNING`）；③ `fiat gateway` 推一条 P0 告警 → **同一条 trace** 下挂 N 个视角 span + 各自子会话的 generation 链（parent 指向 alert 根 span，不是新建 trace）；④ `tracing.enabled: false`（缺省）→ 零网络调用、零定时器、零行为变化、现有测试全绿。`npm run check` + `npm test` 全绿（新增 tracing 用例）。
+
+设计依据：Langfuse 官方 OpenTelemetry 接入文档（`langfuse.com/integrations/native/opentelemetry`：端点 / Basic Auth / `x-langfuse-ingestion-version` 头 / `langfuse.*` 属性映射表）+ Langfuse OpenAPI 对 `/api/public/ingestion` 的弃用标注（`deprecated: true`，「2026-11-16 起 Langfuse Cloud 只接受 `score-create`，其余类型一律拒绝」）。
+
+**关键决策 A：必须走 OTLP，不能用 Langfuse 的 batch ingestion API。**
+
+| 传输 | 端点与形状 | 结论 |
+|---|---|---|
+| Langfuse batch ingestion（v2） | `POST /api/public/ingestion`，body `{batch:[{id,type,timestamp,body}]}`，`type ∈ trace-create / span-create / generation-create / span-update / ...` | ❌ 官方已标 **deprecated**；Cloud 自 **2026-11-16** 起只接受 `score-create`。今天（2026-09-20）照它落地 = 两个月后必坏 |
+| **OTLP over HTTP（JSON）** | `POST {host}/api/public/otel/v1/traces`，`Content-Type: application/json`，`Authorization: Basic base64(pk:sk)` + **`x-langfuse-ingestion-version: 4`** | ✅ 官方指定迁移路径；JSON 编码即可，**零新依赖** |
+
+`x-langfuse-ingestion-version: 4` **不是可选项**：不带它数据走 v4 之前的兼容路径，UI 里最长延迟 10 分钟才可见。
+
+**关键决策 B：自研极简 exporter，不引官方 `langfuse` SDK。**
+
+| | 官方 `langfuse` Node SDK | 自研 OTLP exporter（本阶段） |
+|---|---|---|
+| 依赖面 | 拖进 `@opentelemetry/{api,sdk-trace-node,exporter-trace-otlp-http,resources,semantic-conventions}` 一整棵树 | **零新依赖**（原生 `fetch`），与阶段 13「纯 Node、零新依赖」同一口径 |
+| 我们要的 span 语义 | 自动埋点是 HTTP/DB/框架级，**闸门 / 工单 / 蜂群 / 进化一个都盖不到**——业务 span 照样全部手写 | 同样手写，工作量一致 |
+| 离线可测性 | 要 mock OTel exporter 内部结构 | 注入 `TracingClient` 接口：`InMemoryTracingClient` 断言 + 本地 stub HTTP server 直收 payload |
+| 代价 | — | 放弃 OTel 生态的 auto-instrumentation / Sampler / BatchSpanProcessor；自研有界队列 + 背压 + 重试（约 120 行） |
+
+结论：**自研**。与 `AuditClient` / `EvalSink` / `PolicyClient` 完全同构——接口 + `Noop` / `InMemory` / `Http` 三实现，工厂注入。
+
+**Span 语义（Langfuse 数据模型映射）**：Langfuse 无独立 trace 实体，**根 span 即 trace**。trace 级属性必须下发到**每一个** span（官方明确：要按 userId / sessionId / tags 过滤，必须传播到全部 span，不能只放根 span）：
+
+| 我们的语义 | OTLP 属性 | 落成 Langfuse |
+|---|---|---|
+| 根 span 名 | span `name` | trace name |
+| 会话（多轮聚合） | `langfuse.session.id` = sessionId | Session 分组 |
+| 用户 / 角色 / 环境 | `langfuse.user.id` + `langfuse.trace.metadata.{role,environment}` | 过滤维度 |
+| 入口类型 | `langfuse.trace.tags` = `["chat"\|"gateway"\|"diagnose"\|"ci"\|"evolution", env, role]` | Tags |
+| LLM 轮 | `langfuse.observation.type="generation"` + `gen_ai.operation.name="chat"` + `gen_ai.request.model` + `gen_ai.usage.*` + `langfuse.observation.usage_details`(JSON) | Generation（token / cost 面板） |
+| 工具调用 | `langfuse.observation.type="tool"` | Tool |
+| 闸门 / 工单 / MCP / 蜂群 | `langfuse.observation.type="span"`（缺省） | Span |
+| 错误 / 被拦 | `langfuse.observation.level` = `ERROR` / `WARNING` + OTLP `status.code=2` | 高亮 |
+
+Span 名用**点分层级**（`fiat.turn` / `fiat.llm.turn` / `fiat.tool` / `fiat.mcp.call` / `fiat.gate.*` / `fiat.ticket.*` / `fiat.fanout.angle` / `fiat.alert.*` / `fiat.evolution.review`），一眼看出链路阶段。
+
+**Span 树（两个典型入口）**：
+
+```text
+fiat.turn                     ← 根（= trace）；sessionId / userId / role / environment / tags
+├─ fiat.gate.build            闸门①：按角色+环境裁剪工具集（注册 N / 裁剪 M）
+├─ fiat.llm.turn #1           generation：model / tokens / stopReason
+│   ├─ fiat.tool mcp_rag_query_knowledge_hub          tool
+│   │   └─ fiat.mcp.call      MCP callTool（transport / 耗时）
+│   └─ fiat.tool fiat_cashback_reconcile              tool
+├─ fiat.llm.turn #2           generation（被拦工具的回灌结果在这一轮收口）
+│   └─ fiat.tool <blocked>    tool, level=WARNING, fiat.gate.tool_call="block"
+├─ fiat.gate.can_execute      闸门③：唯一权威判定〔实做挂在本轮，见下「偏差二」〕
+└─ fiat.ticket.create         工单落地（pending，含幂等键）〔实做挂在本轮，见下「偏差二」〕
+```
+
+> 原设计曾把 `fiat.gate.can_execute` / `fiat.ticket.create` 画在 `fiat.tool fiat_cashback_reconcile`
+> 之下（"工具 → 它的闸门判定 / 工单"）。**实做落在 `fiat.turn` 这一层**，原因见下方「偏差二」——
+> 树形仍闭合（`parentSpanId` 全部可追到根），只是这两类 span 比设计浅一层。
+> `fiat.ticket.apply` 同理：人点卡片触发时通常已不在某一轮之内，挂在本轮 / 会话默认父上。
+
+```text
+fiat.alert.handle             ← 根（= trace）；tags=[gateway, P0]；metadata={fingerprint, source}
+├─ fiat.alert.dedupe          幂等判定（命中 → 提前收口 deduped）
+├─ fiat.alert.classify        severity 分级（纯函数）
+└─ fiat.fanout.angle × N      并行诊断：**子 span，不是新 trace**（parent = alert 根）
+    └─ fiat.turn              子会话完整子链路（同 fiat.turn 结构）
+```
+
+> ⚠️ **实做偏差（2026-09-20，P14-89 落地时确认）**：原设计与本文档曾列 `fiat.alert.queue`
+> （inflight 限流 admit / queued / throttled）作为第三段子 span，**实现时未落地**。
+> 原因不是遗漏而是**限流判定当前根本不存在**：阶段 13 的 `InflightGate` 只被 `GatewayServer`
+> 持有（`server.ts` 的 `void inflight;` + 注释「由 runner 层消费」），而 `gateway/runner.ts`
+> 的 `AlertGateway` 从未接过 gate、也没调用过 `tryAcquire` ——
+> 于是 `AlertEventRecord.throttledCount` 永远为 0、`nextQueuedAfterRelease` 无调用点。
+> 给一个**不发生的事件**补 span 是造假，故本轮不补。等限流真正接进 runner（阶段 13 遗留项，
+> 属于行为变更、需单独立项）时，在同一位置补 `fiat.alert.queue` 即可，采集层无需改动。
+
+> ⚠️ **实做偏差二（2026-09-20，P14-90 联调时确认）**：`fiat.gate.can_execute` 与 `fiat.ticket.*`
+> **挂在本轮（`fiat.turn`）之下，而不是设计图里的 `fiat.tool` 之下**。两个都是硬原因、不是懒：
+>
+> 1. **闸门③ 必然先于工具 span 存在**。`fiat.tool` 由 L1a trace-hook 在 `tool_call` 里开；
+>    而 `canExecute` 是 **permission-gate 在同一个 `tool_call` 里、排在 trace-hook 之前**调用的
+>    （工厂顺序 `[gate, audit, modelRouter, …, traceHook]`，"闸门必须最先"是硬约束）。
+>    于是 `trace.toolSpans` 注册表里**还没有**这条 toolCallId —— 查也是空手，只能挂本轮。
+> 2. **`CanExecuteReq` 本身不带 `toolCallId`**（`policy/engine.ts` 只有 `user/tool/environment/input`）。
+>    要按 toolCallId 找父 span，就得给这个**纯函数**的入参加字段——而 `engine.ts` 的价值正是
+>    「零依赖纯函数、被 20+ 测试直接断言」，为一个 span 的层级去动它是本末倒置。
+>
+> 落到本轮是**保守且正确**的选择：归属仍在「这一轮」内，`fiat.tool.name` 属性照旧落在
+> span 上，按工具过滤不受影响；只有"工具 → 闸门"这层视觉嵌套没了。
+> 若将来确实要这层嵌套，正确做法是**把 toolCallId 一路透传**（`BeforeToolCallContext` 里有
+> `toolCallId`）——属于接口变更，单独立项，不要顺手塞进采集层。
+
+> ⚠️ **实做偏差三（2026-09-20，P14-90 联调时修复的真实缺陷）**：`fiat.llm.turn` 一度
+> 与 `fiat.turn` 成了**兄弟**（父都是 `wiring.parentSpanId`），即 `angle → {turn, generation}`，
+> 与设计图「angle → turn → generation」不符；根入口侥幸看不出——`startRootSpan` 复用
+> `startTrace` 预留的 id，generation 的父（`rootSpanId`）**正好等于** `fiat.turn` 的 spanId。
+> 修法：`TracingWiring` 增 `turnSpanId`，`PiHostLoop.runTurn` 开轮时登记、收口时清空，
+> trace-hook 以它为父（退化顺序 `turnSpanId ?? parentSpanId ?? rootSpanId`）。
+> 为什么是 wiring 而不是 `TraceContext`：后者**整条 trace 共享**（蜂群 N 个视角同一个 ctx），
+> 写进去会被并行视角互相踩；wiring 是会话级的（每视角一个、chat 每轮一个）。
+> 同类修正：`fiat.gate.can_execute` / `fiat.ticket.*` 原本缺省的父是 `ctx.rootSpanId`，
+> 在蜂群场景会**直接挂到告警根**、跳出视角树枝；现统一改走 `turnSpanId ?? parentSpanId ?? rootSpanId`。
+>
+> 这三类父归属（本轮 / 会话默认 / 根兜底）与「`fiat.tool` → `fiat.mcp.call`」这一跳的覆盖见
+> `test/tracing-l2.test.ts`（闸门③ 装饰器 + 工单，**零 Pi 依赖、毫秒级**）与
+> `test/mcp-rag.test.ts` 用例 ④（faux + 真实 trace-hook，钉住 `trace.toolSpans` 注册表契约）。
+
+> ⚠️ **验收口径说明（2026-09-20，P14-90 收尾时补记）**：P14-90 要求的「`npm test` 全绿」在**本机
+> 默认隔离模式**（`vitest --run`，`isolate: true`）跑不出干净的绿——不是测试有问题，是**冷加载成本**：
+> 43 个测试文件每一个都要独立 import 一遍本地 Pi TS 源码（vitest 别名指向 `../pi/packages/*/src`），
+> 实测 ~150s/文件；4 个 worker 并行时 `import` 累计近 7000s，CPU 互相争抢会把「用例体内动态 import」
+> 或「磁盘 IO 密集」的用例顶穿 5s 默认超时。
+>
+> 本机两条可用跑法（都已验证）：
+>
+> - `npx vitest --run --no-isolate --maxWorkers=1` —— **推荐**：模块图只付一次导入、零争抢，
+>   全量 375 用例数分钟跑完；
+> - `npx vitest --run --no-isolate --maxWorkers=4` —— 更快，但会出现**争抢假红**，必须隔离复跑甄别，
+>   别把它当真失败。
+>
+> 顺带收拾了三处**环境脆弱**（断言一字未改，只挪成本 / 加余量）：`host-duties.test.ts` 把用例体内的
+> `await import("host/session.ts")` 提到文件级（那笔冷加载被算进用例耗时，实测 51s）；
+> `cli-chat.test.ts` ×2、`evolution-skillstore.test.ts` ×1 给显式超时。
+> 另修一处**与阶段 14 无关的既有 bug**：`evolution-apply.test.ts` 的记忆落盘断言写死了日期
+> `2026-09-12` 却没注入时钟（文件名取真实日期）→ 只在当天能绿。
+
+**蜂群必须挂同一棵 trace**：`diagnosis/{plan,fanout}.ts` 是多视角并行；若每个子会话各开一条 trace，Langfuse 里「一条告警 → 5 个视角 → 37 次工具调用」会碎成 6 条互不相关的 trace，「哪条链路慢、哪个视角在烧 token」直接看不出来。实现上 `fanout` 只多传一个 `parentSpanId`——与评测侧 `parentRunId` 同构。
+
+**采集点（不改 Pi 核心，全部复用既有通道）**：
+
+| 层 | 落点 | 产出 span |
+|---|---|---|
+| L1a（新增） | `host/l1a/trace-hook.ts`：`turn_start` / `turn_end` + 桥接的 `tool_call` / `tool_result` | `fiat.llm.turn`（generation）、`fiat.tool` |
+| 宿主 | `host/loop.ts` 的 `runTurn` / `runTurnSafe` | `fiat.turn`（根）、provider 错误 → span status |
+| 组合根 | `session/factory.ts` 注入 tracer + 尾追 trace-hook + 装饰 policyClient | `fiat.gate.build`、`fiat.gate.can_execute` |
+| L2 | `policy/client.ts` 装饰器 · `approval/ticket.ts` · `host/l1b/mcp-rag.ts` · `diagnosis/*` | `fiat.gate.can_execute`、`fiat.ticket.*`、`fiat.mcp.call`、`fiat.fanout.angle` |
+| 入口 | `gateway/runner.ts` · `cli/chat.ts` | `fiat.alert.*`、根 span 生命周期与 flush |
+
+**⚠️ 被 block 的工具也要出 span（已知坑的正确用法）**：`ExtensionRunner.emitToolCall` 对 block 请求**短路返回**（runner.js:639-657），排在 factories 尾部的 trace-hook 收不到被拦调用的 `tool_call`；且被拦不产生 `tool_result`。这与阶段 11 eval-recorder 踩的是同一个坑，但**处置不同**——eval 干脆不走 `tool_call`，trace **两者都要**：
+
+1. `tool_call` 钩子 → 开 span（此刻已知 args；「能开到」本身就等价于 `fiat.gate.tool_call="allow"`）；
+2. `tool_result` 钩子 → 关 span（补结果 / isError / 耗时）；
+3. `turn_end.toolResults` → **对账补齐**：凡出现在本轮 toolResults 中、却没有对应已开 span 的调用，就是被闸门②拦下的——补一条瞬时 span 并标 `fiat.gate.tool_call="block"` + `level=WARNING`。
+
+第 3 步是**对账**而非兜底：它同时解决「模型猜名调用被闸门①裁掉的工具 → `Tool x not found`」这类越权尝试在 trace 里隐形的问题——**被拦的尝试和成功的调用一样值得被看见**。
+
+**采样 / 背压 / 脱敏（三条硬约束的实现口径）**：
+
+- **采样**：per 入口类型 `sample_rate`（chat 可降；gateway / ci 保持 1.0——告警与评测链路必须全采）。采样决策在**根 span 做一次**，子 span 跟随；不做 per-span 采样，否则 trace 会碎成半棵树。
+- **背压**：有界队列（`max_queue`），满则**丢最旧**并累加 `dropped`；批次 `max_batch` + `flush_interval_ms` 定时刷（定时器必须 `unref()`，**不许把进程钉住**），进程结束 / `SIGINT` 显式 `flush()`。上报失败**只重试 `max_retries` 次、只记计数、绝不抛**。
+- **脱敏**：`capture_content: "off" | "redacted" | "full"`，**缺省 `redacted`**：`input` / `output` 走与审计 / 评测**同一份口径**（只留键 + 短标量 + 长文本截断 + 嵌套以 `<type>` 占位）；`off` 时 payload 里**一个业务文本都没有**；`full` 需显式配置，且 `redact_keys` 命中的键（`prompt` / `token` / `api_key` / 卡号证件号类）在**三种模式下都一律遮成 `[redacted]`**。
+
+**配置（人写锚点，与 `tool_policies.yaml` 同级；`enabled` 缺省 false）**：
+
+```yaml
+# config/tracing.yaml（阶段 14 / P14-82）
+tracing:
+  enabled: ${FIAT_TRACING_ENABLED:-false}   # 缺省关；关时零网络、零定时器、零行为变化
+  provider: langfuse
+  endpoint: ${LANGFUSE_OTLP_ENDPOINT:-https://cloud.langfuse.com/api/public/otel/v1/traces}
+  public_key_env: LANGFUSE_PUBLIC_KEY       # 只存**环境变量名**，密钥值永不落到配置文件
+  secret_key_env: LANGFUSE_SECRET_KEY
+  ingestion_version: "4"                    # 必须带：不带则 UI 延迟最长 10 分钟
+  service_name: fiat-agent
+  capture_content: redacted                 # off | redacted | full
+  redact_keys: [prompt, password, token, api_key, id_card, bank_card, card_no]
+  sample_rate: { chat: 1.0, gateway: 1.0, diagnose: 1.0, ci: 1.0, evolution: 1.0 }
+  batch:
+    max_queue: 2048
+    max_batch: 64
+    flush_interval_ms: 2000
+    max_retries: 2
+    timeout_ms: 5000
+```
+
+- [x] P14-82 **契约与配置**：`src/server/tracing/types.ts`（`TracingConfig` / `TraceKind` / `SpanKind` / `TraceSpan`（`traceId` / `spanId` / `parentSpanId?` / `name` / `kind` / `startNs` / `endNs` / `attributes` / `status` / `level`）/ `AttributeValue` 联合类型 / `TraceContext`（一次 trace 的共享上下文：`traceId` + 根 `spanId` + 采样结论 + trace 级属性）/ `Tracer` 接口）+ `src/server/tracing/config.ts`（`loadTracingConfig(path?)`：读 yaml + `${VAR:-default}` 插值 + 校验——`enabled=true` 而公钥/密钥环境变量缺失 → **fail-fast 抛错**（同 gateway token 口径，不静默降级成「追踪悄悄不工作」）；`capture_content` 非法值 / `sample_rate` 越界 → 拒绝；`DEFAULT_TRACING_CONFIG` 使 `enabled=false`）+ `config/tracing.yaml`
+- [x] P14-83 **OTLP 编码器（纯函数，零依赖）**：`src/server/tracing/ids.ts`（`randomTraceId()` 32 hex / `randomSpanId()` 16 hex / `msToNanos` / `hexId` 校验）+ `src/server/tracing/otlp.ts`（`encodeOtlp(spans, ctx, cfg)` → `{ resourceSpans: [{ resource, scopeSpans: [{ scope, spans }] }] }`：`startTimeUnixNano` 字符串、`attributes` → `{key, value:{stringValue|intValue|doubleValue|boolValue|arrayValue}}`、`langfuse.*` 属性映射、**trace 级属性下发到每个 span**、`gen_ai.*` 语义约定（`gen_ai.operation.name="chat"` / `gen_ai.request.model` / `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens`）、`status.code` 与 `langfuse.observation.level` 对应、脱敏函数 `redact(value, mode, keys)` 三档 + `redact_keys` 一律遮罩）
+- [x] P14-84 **TracingClient 三实现 + 批处理队列**：`src/server/tracing/client.ts` —— `TracingClient` 接口（`send(spans)` / `flush()` / `shutdown()` / `stats()`）+ `NoopTracingClient`（`enabled=false`，**零网络零定时器**）/ `InMemoryTracingClient`（测试断言，与 `InMemoryAuditClient` 同构）/ `HttpOtlpTracingClient`（原生 `fetch` + `AbortSignal.timeout`；Basic auth `Buffer.from(pk + ":" + sk).toString("base64")`；必带 `x-langfuse-ingestion-version`；有界队列丢最旧 + `max_batch` + `flush_interval_ms` 定时器 `unref()` + 重试 + `dropped` 计数；**任何失败都不抛**）
+- [x] P14-85 **Tracer 与 span 构建器**：`src/server/tracing/tracer.ts` —— `createTracer(cfg, client)`：`startTrace({name, kind, sessionId, userId, role, environment, metadata})` → `TraceContext`（生成 traceId + 根 spanId、按 `sample_rate[kind]` 采样，允许注入 `random` 保证测试确定性）；`startSpan(ctx, name, opts)` → `SpanHandle`（`setAttribute` / `setInput` / `setOutput` / `setModel` / `setUsage` / `setLevel` / `setStatus` / `end()`，`end()` 幂等）；`withSpan(ctx, name, opts, fn)`（异常自动 `recordError` 后 rethrow）；`shutdown()`（flush + 取消防抖定时器）；**span 仅在 `end()` 时入队**（OTLP 无 update 事件，一次成型）
+- [x] P14-86 **L1a trace-hook**：`src/server/host/l1a/trace-hook.ts` —— `turn_start` 开 `fiat.llm.turn`（generation）/ `turn_end` 关 span + `gen_ai.usage.*`（取自 `event.message.usage`）+ **对账补 blocked tool span** / `tool_call` 开 `fiat.tool` / `tool_result` 关 span（isError → ERROR）；**尾部追加、只读不拦、缺省不注册**；位置契约更新为 `[gate, audit, modelRouter, ...evalRecorder?, ...evolutionTrigger?, ...traceHook?]`
+- [x] P14-87 **宿主与组合根接线**：`PiHostLoop` 新增可选 `tracer` + `trace: TraceContext`（`runTurn` 开/关根 span `fiat.turn`，`runTurnSafe` 把 provider 错误写 span status/level）；`buildSession` 新增 `tracer?` → ① 开 `fiat.gate.build` span（记录角色 / 环境 / 注册工具数）② 尾部追加 trace-hook ③ 用装饰器包 `policyClient` 产出 `fiat.gate.can_execute` span；`SessionFactoryResult` 透出 `tracer`
+- [x] P14-88 **L2 全链路子 span**：`approval/ticket.ts` 新增可选 `tracer`（`fiat.ticket.create` / `fiat.ticket.approve` / `fiat.ticket.apply` 三处，含幂等键与 token 校验结论）；`host/l1b/mcp-rag.ts` 的 `callTool` 外包 `fiat.mcp.call` span（transport / 耗时 / isError）；`diagnosis/fanout.ts` + `sessionRunner.ts` 透传父 span（每视角一个 `fiat.fanout.angle` span，**挂同一 trace**），子会话用该 span 作父
+- [x] P14-89 **gateway / evolution / CLI 接线**：`gateway/runner.ts` 在 `handleAlert` 开根 span `fiat.alert.handle`（tags=`[gateway, severity]`、metadata=`{fingerprint, source}`）+ dedupe / classify / queue 三段子 span，诊断派发把该 `TraceContext` 透传给 `diagnose()` 使蜂群挂同一棵树；`cli/chat.ts` 装配 tracer 并把 `TraceContext` 交给 `PiHostLoop`；evolution 评审 fork 开独立 trace（`fiat.evolution.review` + metadata `parentSessionId`）；`cli/index.ts` 新增 `fiat trace status`（打印 enabled / endpoint / 队列与丢弃计数，**离线零 Pi 依赖**）；`shutdown` 在 `fiat chat` 结束与 gateway `SIGINT` 时显式 flush；同步 `workspace/AGENTS.md`
+- [x] P14-90 **测试与验收**：`test/tracing-otlp.test.ts`（纯函数：traceId 32 hex / spanId 16 hex / nanos 合法 / `langfuse.*` + `gen_ai.*` 映射 / **trace 级属性出现在每个 span** / 脱敏三档 + `redact_keys` 遮罩）+ `test/tracing-client.test.ts`（本地 stub HTTP server 收包：Basic auth 头与 `x-langfuse-ingestion-version` 正确、批次大小、定时 flush、**队列满丢最旧且计数**、上报失败只重试不抛、`enabled=false` 零请求）+ `test/tracing-hook.test.ts`（faux provider 驱动完整会话：根 span + N 个 generation + tool span **树闭合**；**闸门② block 场景仍出 span 且 level=WARNING**）+ `test/tracing-e2e.test.ts`（gateway 推一条 P0 → 同一 `traceId` 下 alert 根 + N 个视角 span + 子会话 generation 链）；`npm run check` + `npm test` 全绿
+
+**阶段 14 硬约束（实现时不得破）**：
+
+1. **追踪只读不拦**：trace-hook 只订阅、绝不返回 `block`、绝不改写 `event.input` / `content`——与 eval-recorder 同一条底线（唯一合法副作用是 span 入队，且发生在 `end()` 之后）。
+2. **追踪永不进主链路的失败路径**：`TracingClient` 的任何方法都不得抛；队列满 / 网络错只记计数。**观测系统挂掉不能把业务挂掉。**
+3. **缺省关**：`tracing.enabled: false` 走 `NoopTracingClient`，零网络、零定时器、现有测试零改动（fail-safe 惯例，同 `evalSink` / `evolution`）。
+4. **密钥只以环境变量名出现**：`config/tracing.yaml` 只写 `*_env`，不写值；`enabled=true` 而变量缺失 → 启动即失败（fail-fast）。
+5. **不改 Pi 核心、不改错误语义**：OTLP span 是**旁路**，`Agent` / `ExtensionRunner` / 三道闸门的运行时行为一字不动。
+6. **必须走 OTLP**（`/api/public/otel/v1/traces`）；**禁止**回到 `/api/public/ingestion` 的 batch 事件（官方已弃用，2026-11-16 起只收 `score-create`）。
+7. **trace 级属性下发到每个 span**（官方明确要求），否则 Langfuse 里按 userId / sessionId / tags 过滤会漏。
+8. **蜂群挂同一棵 trace**：`fanout` 透传 `parentSpanId`，不许给子会话各开新 trace。
+
 ---
 

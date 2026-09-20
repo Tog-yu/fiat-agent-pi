@@ -23,6 +23,10 @@ import {
 	sanitizeMessages,
 } from "../src/server/host/duties.ts";
 import { PiHostLoop } from "../src/server/host/loop.ts";
+// ⚠️ 静态 import（曾经是**用例体内**的 `await import`）：那份动态加载会把
+// `pi-coding-agent` 的冷启动算进**用例耗时**——本机实测 ~51s，默认 5s 超时必然假红，
+// 并行跑时连 90s 都能撑爆。挪到文件级 import 后，这笔成本落回"文件加载"，不再计入用例。
+import { HostSession } from "../src/server/host/session.ts";
 
 function msg(role: string, content: unknown): AgentMessage {
 	return { role, content } as AgentMessage;
@@ -86,7 +90,6 @@ describe("P8-38 bootstrap context", () => {
 		try {
 			const faux = registerFauxProvider();
 			try {
-				const { HostSession } = await import("../src/server/host/session.ts");
 				const session = HostSession.inMemory();
 				const host = new PiHostLoop({
 					model: faux.getModel(),

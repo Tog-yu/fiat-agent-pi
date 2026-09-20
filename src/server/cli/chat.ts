@@ -32,10 +32,12 @@ import type { SkillStore } from "../evolution/skillStore.ts";
 import type { EvolutionConfig, EvolutionProposal } from "../evolution/types.ts";
 import { applyThenVerify } from "../evolution/verify.ts";
 import { createEvolutionTrigger } from "../host/l1a/evolution-trigger.ts";
+import { createTraceHook } from "../host/l1a/trace-hook.ts";
 import { createProposeTools } from "../host/l1b/propose-tools.ts";
 import { createSkillTools } from "../host/l1b/skill-tools.ts";
 import { loadModelPolicies, piApiName } from "../models/router.ts";
 import type { SessionSubject } from "../session/factory.ts";
+import type { Tracer, TracingSource, TracingWiring } from "../tracing/types.ts";
 
 export interface ChatTurnResult {
 	ok: boolean;
@@ -91,6 +93,18 @@ export interface MakeChatOptions {
 	inMemorySession?: boolean;
 	/** 阶段 12：自进化接线。**缺省 undefined = 完全不开**，现有行为零变化。 */
 	evolution?: EvolutionWiring;
+	/**
+	 * 阶段 14（P14-89）：全链路追踪。**缺省 undefined = 完全不开**（走 Noop，零开销）。
+	 *
+	 * 收的是 `Tracer` 而不是 `TracingWiring`，因为 chat 的链路边界是**一轮用户输入**，
+	 * 不是整个进程：每轮现开一条 trace，多轮靠 `langfuse.session.id`（= 会话 id）聚合。
+	 * 若在这里就钉死一个 `TraceContext`，多轮会复用同一个预留根 spanId
+	 * （同一条 trace 里出现多个同 id 根 span，OTLP 侧直接算脏数据）。
+	 *
+	 * 内部把「当前轮接线」做成**取值器**喂给 `buildSession`：闸门③ / 工单 / MCP 一跳都发生在
+	 * 某一轮之内，必须在调用那一刻取（见 tracing/types.ts 的 `TracingSource`）。
+	 */
+	tracing?: Tracer;
 }
 
 /**
@@ -184,11 +198,36 @@ export function makeChat(opts: MakeChatOptions = {}): ChatFactory | undefined {
 		const evo = opts.evolution;
 		const trigger = evo ? createEvolutionTrigger() : undefined;
 
+		// 阶段 14（P14-89）：逐轮追踪。`tracer` 关着时整体不装配（零开销、零分配）。
+		const tracer = opts.tracing?.enabled ? opts.tracing : undefined;
+		/** 「当前轮」的接线；每开一条新 trace 就换一次（见 MakeChatOptions.tracing 的说明） */
+		let currentTurn: TracingWiring | undefined;
+		const tracingSource: TracingSource | undefined = tracer ? () => currentTurn : undefined;
+		/**
+		 * 开这一轮的 trace。**必须是「每轮现取」而不是构建时钉死**：
+		 * 根 span 名 = trace 名 = `fiat.turn`，一轮一条；sessionId 用会话 id 把多轮聚成一组。
+		 */
+		const perTurnTracing = tracer
+			? (): TracingWiring => {
+					const ctx = tracer.startTrace({
+						name: "fiat.turn",
+						kind: "chat",
+						sessionId: session.id,
+						userId: subject.user.id,
+						role: subject.user.role,
+						environment: subject.environment,
+					});
+					currentTurn = { tracer, trace: ctx };
+					return currentTurn;
+				}
+			: undefined;
+
 		const built = await buildSession(subject, {
 			policiesPath,
 			...(opts.auditClient ? { auditClient: opts.auditClient } : {}),
 			sessionId,
 			modelResolver: registryResolver(registry),
+			...(tracingSource ? { tracing: tracingSource } : {}),
 			...(evo && trigger
 				? {
 						evolution: {
@@ -231,8 +270,17 @@ export function makeChat(opts: MakeChatOptions = {}): ChatFactory | undefined {
 			systemPrompt: built.evolutionPrompt || undefined,
 			onUserTurn: () => service?.noteUserTurn(),
 			getApiKey: resolveKey,
+			// 阶段 14：一轮一条 trace —— 宿主在 runTurn 开头调它现开根 span（`fiat.turn`）
+			...(perTurnTracing ? { perTurnTracing } : {}),
 			...bridgeAgentHooks(runner),
 		});
+
+		// 阶段 14（P14-89）：`turn_start` / `turn_end` **只经 `Agent.subscribe()` 扇出**
+		// （见 host/extensions.ts 的 bridgeLifecycleEvents），不在 bridgeAgentHooks 里。
+		// 不订的话 trace-hook 收不到轮次事件 → 没有 `fiat.llm.turn` generation、
+		// 也没有「被闸门②拦下的调用」对账，trace 上只剩一堆光杆 tool span。
+		// 关追踪时不订阅：保持「关追踪 = 零行为变化」。
+		const unsubLifecycle = tracer ? bridgeLifecycleEvents(host.agent, runner) : undefined;
 
 		if (evo && trigger) {
 			service = buildEvolutionService({
@@ -259,6 +307,7 @@ export function makeChat(opts: MakeChatOptions = {}): ChatFactory | undefined {
 				registryResolver,
 				registry,
 				auditClientOverride: opts.auditClient,
+				...(tracer ? { tracer } : {}),
 			});
 		}
 
@@ -281,6 +330,8 @@ export function makeChat(opts: MakeChatOptions = {}): ChatFactory | undefined {
 			},
 			dispose() {
 				// HostSession 由 SessionManager 持有，transcript 已逐轮落盘；宿主仅持引用。
+				// 生命周期订阅要松开，否则 afterEach/长驻进程里会留着悬挂的 agent 订阅。
+				unsubLifecycle?.();
 			},
 		};
 	};
@@ -320,6 +371,11 @@ function buildEvolutionService(ctx: {
 	) => import("../host/l1a/model-router.ts").ModelResolver;
 	registry: import("../host/l1a/model-router.ts").ModelRegistryLike;
 	auditClientOverride?: AuditClient;
+	/**
+	 * 阶段 14（P14-89）：评审 fork 要开一条**独立 trace**（`fiat.evolution.review`）。
+	 * 缺省 undefined = 不开（fork 行为与阶段 12 字节级一致）。
+	 */
+	tracer?: Tracer;
 }): EvolutionService {
 	const { evo, trigger } = ctx;
 	const log = evo.log;
@@ -439,6 +495,37 @@ function buildEvolutionService(ctx: {
 				...createSkillTools({ store: evo.skillStore, recordUsage: false }),
 				...createProposeTools({ proposals: evo.proposals, context: input.context }),
 			];
+			// 阶段 14（P14-89）：评审 fork **独立成一条 trace**。
+			// 虽然它由主会话轮末触发，但它是一次完整的 LLM 会话（另一个 systemPrompt、另一套工具、
+			// 另一份 token 账单）；塞进主会话的 trace 会让「这轮用户请求花了多少」被评审污染。
+			// 归属关系靠 metadata.parentSessionId 保留——两个视角都不丢。
+			const forkTracer = ctx.tracer;
+			const forkTracing: TracingWiring | undefined = forkTracer?.enabled
+				? {
+						tracer: forkTracer,
+						trace: forkTracer.startTrace({
+							name: "fiat.evolution.review",
+							kind: "evolution",
+							sessionId: forkSession.id,
+							userId: ctx.subject.user.id,
+							role: ctx.subject.user.role,
+							environment: ctx.subject.environment,
+							metadata: { parentSessionId: ctx.sessionId, runId: input.context.runId },
+						}),
+					}
+				: undefined;
+			// 阶段 14：fork 也挂 trace-hook —— 没有它，`fiat.evolution.review` 只是一个光杆根 span，
+			// 看不到评审跑了几轮、烧了多少 token（而「评审花多少钱」正是自进化的主要成本项）。
+			// 只注册 trace-hook（只读不拦）：fork 的工具白名单与 #5 递归防护一字不动。
+			const forkRunner = forkTracing
+				? (
+						await ctx.setupEmbeddedExtensions({
+							cwd: ctx.cwd,
+							agentDir: ctx.agentDir,
+							factories: [createTraceHook({ source: forkTracing })],
+						})
+					).runner
+				: undefined;
 			// #1 继承 runtime：同一个 model + 同一个 resolveKey → 命中同一条 prefix cache
 			// #5 递归防护：fork **不传 evolution**，所以它里面没有 evolution-trigger，评审不会触发评审
 			const forkHost = new ctx.PiHostLoop({
@@ -448,8 +535,16 @@ function buildEvolutionService(ctx: {
 				tools: forkTools,
 				session: forkSession,
 				getApiKey: ctx.resolveKey,
+				...(forkTracing ? { tracing: forkTracing } : {}),
+				...(forkRunner ? ctx.bridgeAgentHooks(forkRunner, { cwd: ctx.cwd }) : {}),
 			});
-			await forkHost.runTurnSafe(input.prompt);
+			// 同上：轮次事件必须订阅，否则 fork 的 trace 里没有 generation（token 无从看起）
+			const unsubFork = forkRunner ? ctx.bridgeLifecycleEvents(forkHost.agent, forkRunner) : undefined;
+			try {
+				await forkHost.runTurnSafe(input.prompt);
+			} finally {
+				unsubFork?.();
+			}
 			return ctx.lastAssistantText(forkHost.messages);
 		},
 		...(log ? { log } : {}),

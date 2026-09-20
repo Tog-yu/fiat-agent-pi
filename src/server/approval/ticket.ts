@@ -20,6 +20,8 @@
 import type { AuditClient, AuditOutcome } from "../audit/client.ts";
 import type { FiatToolClient, FiatToolResult } from "../fiat-tools/client.ts";
 import type { PolicyClient } from "../policy/client.ts";
+import { LANGFUSE_KEYS, OBS_TYPE } from "../tracing/otlp.ts";
+import { type AttributeValue, resolveTracing, type SpanHandle, type TracingSource } from "../tracing/types.ts";
 
 export type TicketStatus = "pending" | "approved" | "rejected" | "applied" | "expired";
 
@@ -187,6 +189,14 @@ export interface ApprovalDeps {
 	tokenTtlMs: number;
 	/** 审计用的 sessionId（与 tool_result 审计对齐） */
 	sessionId: string;
+	/**
+	 * 阶段 14（P14-88）：全链路追踪。**缺省 undefined = 完全不开**（零开销）。
+	 *
+	 * 审批链是「LLM 之外」的确定性流程，追踪对它尤其重要：工单从建单到执行中间隔着**人**的
+	 * 一段时间，这段在审计表里只有一个 `ticket_created` 和一个 `applied`。有了 span 之后
+	 * 「审批卡推出去多久才被点通过、apply 时是 policy 拒的还是 token 失效」才第一次可见。
+	 */
+	tracing?: TracingSource;
 }
 
 export interface RequestApplyInput {
@@ -226,6 +236,7 @@ export class ApprovalService {
 	private readonly sha256: (s: string) => string;
 	private readonly tokenTtlMs: number;
 	private readonly sessionId: string;
+	private readonly tracing?: TracingSource;
 
 	constructor(d: ApprovalDeps) {
 		this.store = d.store;
@@ -239,15 +250,52 @@ export class ApprovalService {
 		this.sha256 = d.sha256;
 		this.tokenTtlMs = d.tokenTtlMs;
 		this.sessionId = d.sessionId;
+		this.tracing = d.tracing;
+	}
+
+	/**
+	 * 审批链子 span 的统一入口；未开追踪 / 未采样 / 尚未开始任何一轮 → undefined，调用点用 `?.`。
+	 *
+	 * 收**取值器**：工单的三个动作（create / approve / apply）分别发生在不同时刻——
+	 * `create` 在某一轮工具调用里，`approve` / `apply` 往往在**人点完卡片之后**（那时可能已经
+	 * 换了一轮、甚至换了进程）。只有等到调用那一刻才知道该挂到哪条 trace 上。
+	 */
+	#span(name: string, attrs: Record<string, AttributeValue>): SpanHandle | undefined {
+		const w = resolveTracing(this.tracing);
+		if (!w?.trace.sampled) return undefined;
+		return w.tracer.startSpan(w.trace, name, {
+			kind: "internal",
+			// 挂进**当前轮**（`fiat.turn`）而不是 trace 根：`approve` / `apply` 常常发生在
+			// 人点完卡片之后，若那时没有"当前轮"，`turnSpanId` 已清空 → 退回会话默认父 / 根。
+			// 指明父的收益在蜂群场景最明显：子会话的 trace 根是**告警** span，
+			// 不指明父的话 `fiat.ticket.*` 会直接挂到告警上、跳出视角树枝。
+			parentSpanId: w.turnSpanId ?? w.parentSpanId ?? w.trace.rootSpanId,
+			attributes: { [LANGFUSE_KEYS.obsType]: OBS_TYPE.span, "fiat.ticket.stage": name, ...attrs },
+		});
 	}
 
 	/** dry-run 之后调用：建单(pending) + 一次性 token + 推 Lark 卡。 */
 	async requestApply(input: RequestApplyInput): Promise<RequestApplyResult> {
+		const span = this.#span("fiat.ticket.create", {
+			"fiat.tool.name": input.tool,
+			"fiat.ticket.idempotency_key": input.idempotencyKey,
+			"fiat.ticket.environment": input.subject.environment,
+		});
+		// 有多条 early-return 分支，统一经 finish 收口，避免漏关 span（span 漏关 = 树上一个洞）
+		const finish = (r: RequestApplyResult, replayed: boolean): RequestApplyResult => {
+			span?.setAttribute("fiat.ticket.id", r.ticketId);
+			span?.setAttribute("fiat.ticket.status", r.status);
+			span?.setAttribute("fiat.ticket.replayed", replayed);
+			span?.setStatus("ok");
+			span?.end();
+			return r;
+		};
+
 		// 幂等：相同键已存在则重放（pending 重签 token，避免重复 Lark 推送）
 		const existing = await this.store.findByKey(input.idempotencyKey);
 		if (existing) {
 			if (existing.status === "applied" || existing.status === "rejected") {
-				return { ticketId: existing.ticketId, token: "", status: existing.status };
+				return finish({ ticketId: existing.ticketId, token: "", status: existing.status }, true);
 			}
 			if (existing.status === "expired") {
 				// 过期单不重放，重新建单
@@ -256,7 +304,7 @@ export class ApprovalService {
 				existing.tokenHash = this.sha256(token);
 				existing.expiresAt = this.now() + this.tokenTtlMs;
 				await this.store.update(existing);
-				return { ticketId: existing.ticketId, token, status: existing.status };
+				return finish({ ticketId: existing.ticketId, token, status: existing.status }, true);
 			}
 		}
 
@@ -282,34 +330,55 @@ export class ApprovalService {
 		ticket.larkMessageId = messageId;
 		await this.store.update(ticket);
 		await this.#audit("ticket_created", ticket, `Lark card ${messageId}`);
-		return { ticketId: ticket.ticketId, token, status: "pending" };
+		return finish({ ticketId: ticket.ticketId, token, status: "pending" }, false);
 	}
 
 	/** Lark 卡片「通过」回调（L2 内部调用，非模型）：pending → approved。 */
 	async approve(ticketId: string): Promise<ApprovalTicketRecord> {
-		const t = await this.store.get(ticketId);
-		if (!t) throw new Error(`ticket ${ticketId} not found`);
-		if (t.status !== "pending") throw new Error(`ticket ${ticketId} not pending (${t.status})`);
-		if (this.now() > t.expiresAt) {
-			t.status = "expired";
+		const span = this.#span("fiat.ticket.approve", { "fiat.ticket.id": ticketId });
+		try {
+			const t = await this.store.get(ticketId);
+			if (!t) throw new Error(`ticket ${ticketId} not found`);
+			if (t.status !== "pending") throw new Error(`ticket ${ticketId} not pending (${t.status})`);
+			if (this.now() > t.expiresAt) {
+				t.status = "expired";
+				await this.store.update(t);
+				throw new Error(`ticket ${ticketId} expired`);
+			}
+			t.status = "approved";
+			t.approvedAt = this.now();
 			await this.store.update(t);
-			throw new Error(`ticket ${ticketId} expired`);
+			await this.#audit("ticket_approved", t);
+			span?.setAttribute("fiat.ticket.status", "approved");
+			span?.setStatus("ok");
+			return t;
+		} catch (error) {
+			span?.setStatus("error", error instanceof Error ? error.message : String(error));
+			throw error;
+		} finally {
+			span?.end();
 		}
-		t.status = "approved";
-		t.approvedAt = this.now();
-		await this.store.update(t);
-		await this.#audit("ticket_approved", t);
-		return t;
 	}
 
 	async reject(ticketId: string, reason = "rejected by approver"): Promise<ApprovalTicketRecord> {
-		const t = await this.store.get(ticketId);
-		if (!t) throw new Error(`ticket ${ticketId} not found`);
-		if (t.status !== "pending") throw new Error(`ticket ${ticketId} not pending (${t.status})`);
-		t.status = "rejected";
-		await this.store.update(t);
-		await this.#audit("ticket_rejected", t, reason);
-		return t;
+		const span = this.#span("fiat.ticket.reject", { "fiat.ticket.id": ticketId });
+		try {
+			const t = await this.store.get(ticketId);
+			if (!t) throw new Error(`ticket ${ticketId} not found`);
+			if (t.status !== "pending") throw new Error(`ticket ${ticketId} not pending (${t.status})`);
+			t.status = "rejected";
+			await this.store.update(t);
+			await this.#audit("ticket_rejected", t, reason);
+			span?.setAttribute("fiat.ticket.status", "rejected");
+			// 人拒了不是故障，是流程正常走完 —— WARNING 而非 ERROR
+			span?.setLevel("WARNING");
+			return t;
+		} catch (error) {
+			span?.setStatus("error", error instanceof Error ? error.message : String(error));
+			throw error;
+		} finally {
+			span?.end();
+		}
 	}
 
 	/** 列出全部工单（CLI `fiat tickets` / 后台用）；按创建时间倒序 */
@@ -322,18 +391,35 @@ export class ApprovalService {
 	 * 工具侧以 isError:false 回灌模型，避免重试绕行。
 	 */
 	async apply(ticketId: string, token: string): Promise<ApplyResult> {
+		const span = this.#span("fiat.ticket.apply", { "fiat.ticket.id": ticketId });
+		const done = (r: ApplyResult): ApplyResult => {
+			span?.setAttribute("fiat.ticket.result", r.ok ? "applied" : r.code);
+			if (r.ok) {
+				span?.setAttribute("fiat.ticket.status", "applied");
+				span?.setAttribute("fiat.tool.name", r.tool);
+				span?.setStatus("ok");
+			} else {
+				// 「未审批 / token 不对 / policy 拒」都是**预期内的业务结论**，不是故障：
+				// 用 WARNING 让它在 trace 列表里显眼，但不污染错误率
+				span?.setLevel("WARNING");
+				span?.setAttribute("fiat.ticket.message", r.message);
+			}
+			span?.end();
+			return r;
+		};
+
 		const t = await this.store.get(ticketId);
-		if (!t) return { ok: false, code: "not_found", message: `ticket ${ticketId} not found` };
+		if (!t) return done({ ok: false, code: "not_found", message: `ticket ${ticketId} not found` });
 		if (this.now() > t.expiresAt) {
 			t.status = "expired";
 			await this.store.update(t);
-			return { ok: false, code: "expired", message: `ticket ${ticketId} expired` };
+			return done({ ok: false, code: "expired", message: `ticket ${ticketId} expired` });
 		}
 		if (t.status !== "approved") {
-			return { ok: false, code: "pending_approval", message: `ticket ${ticketId} pending approval` };
+			return done({ ok: false, code: "pending_approval", message: `ticket ${ticketId} pending approval` });
 		}
 		if (this.sha256(token) !== t.tokenHash) {
-			return { ok: false, code: "invalid_token", message: "invalid one-time token" };
+			return done({ ok: false, code: "invalid_token", message: "invalid one-time token" });
 		}
 		// L2 再查一次：不信任 L1 放行结论
 		const verdict = await this.policy.canExecute({
@@ -343,14 +429,14 @@ export class ApprovalService {
 			input: t.payload,
 		});
 		if (!verdict.allowed) {
-			return { ok: false, code: "denied", message: verdict.reason ?? "denied by policy" };
+			return done({ ok: false, code: "denied", message: verdict.reason ?? "denied by policy" });
 		}
 		const result = await this.fiat.applyTool(t.tool, t.payload);
 		t.status = "applied";
 		t.appliedAt = this.now();
 		await this.store.update(t);
 		await this.#audit("applied", t);
-		return { ok: true, appliedAt: t.appliedAt, tool: t.tool, result };
+		return done({ ok: true, appliedAt: t.appliedAt, tool: t.tool, result });
 	}
 
 	async get(ticketId: string): Promise<ApprovalTicketRecord | null> {

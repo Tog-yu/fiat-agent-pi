@@ -96,6 +96,10 @@ describe("P12-69/70 落盘路径", () => {
 		config: CFG,
 		sessionId: "sess-1",
 		environment: "dev",
+		// 记忆类提案的落盘文件名由 `now()` 决定（`memoryStore.dayStamp` → UTC 日期），
+		// 而下面的用例断言的是 `memory/2026-09-12.md`。**必须注入固定时钟**——
+		// 用真实时间的话这个用例只在 2026-09-12 当天能过（写在当天，之后一直是红的）。
+		now: () => new Date("2026-09-12T00:00:00.000Z"),
 	});
 
 	function verifyDeps(runCase: (caseId: string) => Promise<number | undefined>) {

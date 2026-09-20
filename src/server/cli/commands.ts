@@ -71,8 +71,41 @@ export function renderSkills(rows: readonly SkillMeta[]): string {
 		.join("\n");
 }
 
-export const HELP = `fiat —— 法币业务 CLI（pi-host 内嵌宿主驱动，不改 Pi 核心）
+/** 追踪状态报告的载荷（`fiat trace status`，阶段 14 / P14-89） */
+export interface TraceStatus {
+	enabled: boolean;
+	endpoint: string;
+	serviceName: string;
+	captureContent: string;
+	/** 凭据是否解析到（env 变量存在）；enabled=true 时必然为 true（配置加载 fail-fast） */
+	credentials: boolean;
+	/** 端点连通性不做网络探测（离线命令不许打网络）；只报队列与丢弃计数 */
+	stats: { queued: number; sent: number; batches: number; dropped: number; failed: number };
+}
 
+/**
+ * 追踪状态渲染（`fiat trace status`）。**零网络**：只看本地配置与进程内计数——
+ * 一个"诊断不工作"的命令如果自己要先发网络请求，那它自己就是不可靠的。
+ */
+export function renderTrace(s: TraceStatus): string {
+	const lines = [
+		`追踪：${s.enabled ? "已开启" : "已关闭（缺省；设 FIAT_TRACING_ENABLED=true 开启）"}`,
+		`服务名：${s.serviceName}`,
+	];
+	if (s.enabled) {
+		lines.push(
+			`端点：${s.endpoint}`,
+			`凭据：${s.credentials ? "已从环境变量解析" : "缺失（不应发生：开启追踪时配置加载已 fail-fast）"}`,
+			`内容采集：${s.captureContent}（off / redacted / full）`,
+			`队列：待发 ${s.stats.queued}　已发 ${s.stats.sent} span / ${s.stats.batches} 批　丢弃 ${s.stats.dropped}　失败批次 ${s.stats.failed}`,
+		);
+	} else {
+		lines.push("提示：关闭状态下零网络、零定时器，span 全部丢弃。");
+	}
+	return lines.join("\n");
+}
+
+export const HELP = `fiat —— 法币业务 CLI（pi-host 内嵌宿主驱动，不改 Pi 核心）
 用法:
   fiat <command> [参数] [--flag value]
 
@@ -106,11 +139,15 @@ export const HELP = `fiat —— 法币业务 CLI（pi-host 内嵌宿主驱动�
       --verbose            打印每个请求的处理结果
       POST /hooks/alert 接告警平台推送：Bearer token 鉴权 → fingerprint 去重
       → severity 分级（P0/P1 自动并行诊断，P2+ 落库 + Lark 摘要卡）
+  trace status             全链路追踪状态（阶段 14；离线可跑，零网络）
   help                     显示本帮助
 
 说明:
   chat / diagnose 需要模型（环境变量 FIAT_MODEL=provider/model + 对应密钥）；
   未配置时该命令会明确提示，其余命令完全离线可用。
+
+  全链路追踪（阶段 14）需要 FIAT_TRACING_ENABLED=true + LANGFUSE_PUBLIC_KEY /
+  LANGFUSE_SECRET_KEY，端点与采样见 config/tracing.yaml；关时零开销。
 
   自进化循环（阶段 12）需要 FIAT_EVOLUTION=1 才在 chat 会话里启用；
   设计见 Obsidian「法币定制 Agent DEV_SPEC（Pi 版）」§10。`;

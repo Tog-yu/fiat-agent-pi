@@ -4,9 +4,13 @@ import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setupEmbeddedExtensions } from "../src/server/host/extensions.ts";
+import { bridgeAgentHooks, bridgeLifecycleEvents, setupEmbeddedExtensions } from "../src/server/host/extensions.ts";
+import { createTraceHook } from "../src/server/host/l1a/trace-hook.ts";
 import { createMcpRagTools, type McpClientLike, type RagStatus } from "../src/server/host/l1b/mcp-rag.ts";
 import { PiHostLoop } from "../src/server/host/loop.ts";
+import { InMemoryTracingClient } from "../src/server/tracing/client.ts";
+import { createTracer } from "../src/server/tracing/tracer.ts";
+import { DEFAULT_TRACING_CONFIG, type TracingWiring } from "../src/server/tracing/types.ts";
 
 interface CapturedTool {
 	name: string;
@@ -176,5 +180,68 @@ describe("P1-5/P1-6/P1-7 mcp-rag 扩展", () => {
 		expect(timeoutTool).toBeDefined();
 		if (!timeoutTool) throw new Error("timeout tool not registered");
 		await expect(timeoutTool.execute("c2", { query: "x" }, undefined, undefined, {})).rejects.toThrow("超时");
+	});
+
+	it("④ P14-88 追踪：fiat.mcp.call 挂在**它那次调用**的 fiat.tool 之下（不是根）", async () => {
+		const client = new InMemoryTracingClient();
+		const tracer = createTracer({ ...DEFAULT_TRACING_CONFIG, enabled: true }, client, { random: () => 0 });
+		const ctx = tracer.startTrace({ name: "fiat.turn", kind: "chat", sessionId: "s-mcp" });
+		const wiring: TracingWiring = { tracer, trace: ctx };
+
+		const tools = await createMcpRagTools({
+			config: { transport: "stdio" },
+			clientFactory: () => mockClient(),
+			onStatus: () => {},
+			tracing: wiring,
+		});
+		// trace-hook 是 `trace.toolSpans` 的**唯一写方**；不注册它，MCP span 就只能挂根
+		const { runner } = await setupEmbeddedExtensions({
+			cwd: tempDir,
+			agentDir: tempDir,
+			factories: [createTraceHook({ source: wiring })],
+		});
+
+		const faux = registerFauxProvider();
+		try {
+			faux.setResponses([
+				fauxAssistantMessage([fauxToolCall("mcp_rag_query_knowledge_hub", { query: "返现规则" })], {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage("done"),
+			]);
+			const host = new PiHostLoop({
+				model: faux.getModel(),
+				getApiKey: () => "faux-key",
+				tools,
+				tracing: wiring,
+				...bridgeAgentHooks(runner),
+			});
+			// 轮次事件只经 subscribe 扇出（见 host/extensions.ts）：漏订就没有 fiat.llm.turn
+			const unsub = bridgeLifecycleEvents(host.agent, runner);
+			await host.runTurn("查一下返现规则");
+			unsub();
+		} finally {
+			faux.unregister();
+		}
+
+		const spans = client.entries();
+		const tool = spans.find((s) => s.name === "fiat.tool mcp_rag_query_knowledge_hub");
+		const gen = spans.find((s) => s.name === "fiat.llm.turn");
+		const mcp = spans.find((s) => s.name === "fiat.mcp.call");
+		expect(tool).toBeDefined();
+		expect(mcp).toBeDefined();
+		// 「tool → mcp」这一跳正是「RAG 慢在哪一跳」的答案来源：
+		// 父取 `trace.toolSpans.get(toolCallId)`（toolCallId 每次唯一，并行诊断下天然并发安全）
+		expect(tool?.parentSpanId).toBe(gen?.spanId);
+		expect(mcp?.parentSpanId).toBe(tool?.spanId);
+		expect(mcp?.attributes["fiat.mcp.tool"]).toBe("query_knowledge_hub");
+		expect(mcp?.attributes["fiat.mcp.transport"]).toBe("stdio");
+
+		// 树闭合：每个 parentSpanId 都能追到根
+		const ids = new Set(spans.map((s) => s.spanId));
+		for (const s of spans) {
+			expect(s.traceId).toBe(ctx.traceId);
+			if (s.parentSpanId) expect(ids.has(s.parentSpanId)).toBe(true);
+		}
 	});
 });

@@ -19,6 +19,8 @@
 
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { LANGFUSE_KEYS, OBS_TYPE } from "../../tracing/otlp.ts";
+import { resolveTracing, type TracingSource } from "../../tracing/types.ts";
 import type { HostTool } from "../tools.ts";
 import { hostToolFromDefinition } from "../tools.ts";
 import { type McpCallResult, parseMcpContent, textSummary } from "./mcp-rag-content.ts";
@@ -27,7 +29,6 @@ import { createTransport, type RagMcpConfig } from "./mcp-rag-transport.ts";
 
 export type { RagMcpConfig } from "./mcp-rag-transport.ts";
 export { ragConfigFromEnv } from "./mcp-rag-transport.ts";
-
 export type RagStatus = "ready" | "unavailable";
 
 /** 最小 client 接口：真实 SDK 与测试 mock 都满足 */
@@ -48,6 +49,12 @@ export interface McpRagDeps {
 	onStatus?: (status: RagStatus, detail: string) => void;
 	/** 工具白名单谓词（三道闸门之①：会话级裁剪，模型根本看不到被拒工具）。缺省不过滤 */
 	allowedTools?: (registeredToolName: string) => boolean;
+	/**
+	 * 阶段 14（P14-88）：全链路追踪。**缺省 undefined = 不开**（零开销）。
+	 * 挂了之后每次 `callTool` 出一个 `fiat.mcp.call` 子 span，父 span 由
+	 * `trace.toolSpans`（toolCallId → tool span）解析——这样「tool → mcp」的嵌套才在树里。
+	 */
+	tracing?: TracingSource;
 }
 
 function defaultClient(cfg: RagMcpConfig): McpClientLike {
@@ -118,7 +125,26 @@ export async function createMcpRagTools(deps: McpRagDeps): Promise<HostTool[]> {
 					description: t.description ?? "",
 					promptSnippet: t.description ?? "",
 					parameters: mcpSchemaToTypeBox(t.inputSchema),
-					async execute(_toolCallId, params) {
+					async execute(toolCallId, params) {
+						// 阶段 14（P14-88）：MCP 一跳单独成 span。父 span 从注册表取——
+						// 此刻我们只有 toolCallId，tool span 的 id 在 trace-hook 手里。
+						// 现取（不是构建时钉住）：chat 是 per-turn trace，工具执行在某一轮之内。
+						const wiring = resolveTracing(deps.tracing);
+						const parentSpanId = wiring?.trace.toolSpans?.get(toolCallId);
+						const span =
+							wiring?.trace.sampled === true
+								? wiring.tracer.startSpan(wiring.trace, "fiat.mcp.call", {
+										kind: "client",
+										...(parentSpanId ? { parentSpanId } : {}),
+										attributes: {
+											[LANGFUSE_KEYS.obsType]: OBS_TYPE.span,
+											"fiat.mcp.tool": t.name,
+											"fiat.mcp.transport": config.transport,
+											"fiat.mcp.timeout_ms": timeoutMs,
+										},
+									})
+								: undefined;
+						span?.setInput(params);
 						let result: McpCallResult;
 						try {
 							result = await withTimeout(
@@ -128,13 +154,20 @@ export async function createMcpRagTools(deps: McpRagDeps): Promise<HostTool[]> {
 							);
 						} catch (err) {
 							// 超时 / 网络错误：抛出 → Agent 循环标记 isError 回灌模型（文本含"可重试"提示）
+							span?.setStatus("error", err instanceof Error ? err.message : String(err));
+							span?.end();
 							throw err instanceof Error ? err : new Error(String(err));
 						}
 						const content = parseMcpContent(result.content);
 						if (result.isError) {
 							// MCP 业务错误：透传摘要，不当可信知识；抛出 → isError
+							span?.setStatus("error", "MCP returned isError");
+							span?.end();
 							throw new Error(textSummary(result.content) || "RAG MCP 返回 isError");
 						}
+						span?.setOutput(textSummary(result.content));
+						span?.setStatus("ok");
+						span?.end();
 						return { content, details: { mcpTool: t.name } };
 					},
 				}),

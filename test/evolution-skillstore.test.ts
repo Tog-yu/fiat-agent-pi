@@ -295,7 +295,9 @@ describe("P12-71 Curator", () => {
 		// 归档 = 从 list 里消失（软删，仍在 .archive）
 		expect(store.list().map((s) => s.name)).toEqual(["fresh", "old"]);
 		expect(store.restore("ancient")).toBe(true);
-	});
+		// 显式放宽超时：本用例建 3 个技能（每个都落盘 + 快照），是**磁盘 IO 密集**的同步用例——
+		// 单跑 ~4.7s，已贴着默认 5s；并行跑时必然假红。断言一字未改。
+	}, 30_000);
 
 	it("pin 是免死金牌：既不 stale 也不 archive，且进报告", () => {
 		const now = Date.parse("2026-09-12T00:00:00.000Z");

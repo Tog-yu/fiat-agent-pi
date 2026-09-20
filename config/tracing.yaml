@@ -1,0 +1,61 @@
+# 全链路追踪配置（阶段 14 / P14-82）
+#
+# 设计依据：DEV_SPEC.md §8 阶段 14（Langfuse OTLP/HTTP 全链路追踪）。
+# 本文件是**人写的锚点**（与 tool_policies.yaml / evolution.yaml / gateway.yaml 同级）——
+# 追踪只读它，永不写它。
+#
+# ── 两条容易配错的地方，先读这里 ────────────────────────────────
+# 1. endpoint 必须是 **OTLP traces 端点**：`{host}/api/public/otel/v1/traces`。
+#    **不要**填 `/api/public/ingestion` —— 那是 Langfuse 已弃用的 batch ingestion API，
+#    Langfuse Cloud 自 2026-11-16 起只接受 score-create，其余事件类型一律拒绝。
+# 2. 密钥值**不写在这里**，只写环境变量名（public_key_env / secret_key_env）。
+#    开了追踪（enabled=true）而变量缺失 → 进程启动即失败，不会静默降级成「追踪悄悄不工作」。
+#
+# 缺省值本文件未给时取 src/server/tracing/types.ts 的 DEFAULT_TRACING_CONFIG。
+# `${VAR:-default}` 在加载时由 loadTracingConfig() 插值。
+
+tracing:
+  # 缺省关。关时走 NoopTracingClient：零网络、零定时器、现有行为零变化。
+  enabled: ${FIAT_TRACING_ENABLED:-false}
+
+  provider: langfuse
+
+  # OTLP/HTTP traces 端点（EU 区；US 用 us.cloud.langfuse.com，JP 用 jp.cloud.langfuse.com）
+  # 自建实例（>= v3.22.0）：http://localhost:3000/api/public/otel/v1/traces
+  endpoint: ${LANGFUSE_OTLP_ENDPOINT:-https://cloud.langfuse.com/api/public/otel/v1/traces}
+
+  # 只存变量名，不存值
+  public_key_env: LANGFUSE_PUBLIC_KEY
+  secret_key_env: LANGFUSE_SECRET_KEY
+
+  # 必须带 `x-langfuse-ingestion-version: 4`；不带则数据走旧兼容路径，UI 里最长 10 分钟才可见
+  ingestion_version: "4"
+
+  service_name: fiat-agent
+
+  # 内容采集档位（脱敏硬约束）：
+  #   off      —— payload 里一个业务文本都没有（只留结构/计数/时间）
+  #   redacted —— 缺省。只留键 + 短标量 + 长文本截断 + 嵌套以 <type> 占位
+  #   full     —— 需显式打开；redact_keys 命中的键在三种模式下都一律遮罩
+  capture_content: redacted
+
+  # 命中的键在任何档位下都遮成 [redacted]（大小写不敏感，子串匹配）
+  redact_keys: [prompt, password, token, api_key, idcard, id_card, bank_card, card_no, phone]
+
+  # 采样（per 入口类型）。只在根 span 决策一次，子 span 跟随——per-span 采样会把 trace 采成半棵树。
+  # gateway / diagnose / ci 建议恒为 1.0：告警与评测链路必须全采，否则「这条告警为什么慢」永远答不上。
+  sample_rate:
+    chat: 1.0
+    gateway: 1.0
+    diagnose: 1.0
+    ci: 1.0
+    evolution: 1.0
+
+  # 上报批处理与背压：队列满丢最旧并累加 dropped；flush 定时器 unref()，不把进程钉住；
+  # 失败只重试 max_retries 次、只记计数、绝不抛（观测系统挂掉不能把业务挂掉）。
+  batch:
+    max_queue: 2048
+    max_batch: 64
+    flush_interval_ms: 2000
+    max_retries: 2
+    timeout_ms: 5000

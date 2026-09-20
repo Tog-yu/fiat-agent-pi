@@ -27,6 +27,7 @@ import type {
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
+import type { TracingWiring } from "../tracing/types.ts";
 import type { SanitizeOptions } from "./duties.ts";
 import { buildBootstrapContext, sanitizeMessages } from "./duties.ts";
 import type { HostResources } from "./resources.ts";
@@ -35,6 +36,13 @@ import { type HostTool, registerTools } from "./tools.ts";
 
 /** provider 名 → API key；缺省读 `process.env[${PROVIDER}_API_KEY]` */
 export type ApiKeyResolver = (provider: string) => string | undefined;
+
+/**
+ * 宿主层「一次用户轮」的 span 名（阶段 14）。
+ * 既是根 span 名（chat 的 trace 名同为此），也是**子会话**挂在视角树枝上的顶层 span 名
+ * ——两者必须是同一个名字，否则「同一条链路」在 Langfuse 里会长出两种叶子（见 runTurn 注释）。
+ */
+export const TURN_SPAN_NAME = "fiat.turn";
 
 export interface HostLoopOptions {
 	/** 当前轮要用的模型（含 provider / api）；写入 `AgentState.model` */
@@ -99,6 +107,23 @@ export interface HostLoopOptions {
 	 * 所以轮次计数点只能在这里（§10.4 的关键修正）。
 	 */
 	onUserTurn?: () => void;
+	/**
+	 * 阶段 14（P14-87）：全链路追踪。**缺省 undefined = 完全不开**（走 Noop，零开销）。
+	 *
+	 * 宿主在这里持有的是**根 span**（`fiat.turn` / `fiat.alert.handle`）：
+	 * 根 span 的生命周期等于「一次用户轮」，只有宿主知道这个边界（对齐 `onUserTurn`
+	 * 为什么必须在宿主的原因——Pi 的事件里没有「用户轮次」）。子 span（generation / tool）
+	 * 由 L1a trace-hook 挂在它下面。
+	 */
+	tracing?: TracingWiring;
+	/**
+	 * 阶段 14：**每轮现取**一份追踪接线，优先级高于 `tracing`。
+	 *
+	 * 给谁用：`fiat chat` 的交互 REPL。它的语义是「**一轮用户输入 = 一条 trace**」，
+	 * 多轮靠 `langfuse.session.id` 聚合。若沿用固定的 `tracing`，多轮会复用同一个
+	 * 预留根 spanId → 同一条 trace 里出现多个同 id 的根 span（OTLP 侧直接算脏数据）。
+	 */
+	perTurnTracing?: () => TracingWiring | undefined;
 }
 
 /** 取最后一条 assistant 消息的文本作为该轮回复 */
@@ -133,12 +158,16 @@ export class PiHostLoop {
 	private readonly hostSession?: HostSession;
 	private readonly beforeAgentStart?: (prompt: string) => Promise<void>;
 	private readonly onUserTurn?: () => void;
+	private readonly tracing?: TracingWiring;
+	private readonly perTurnTracing?: () => TracingWiring | undefined;
 
 	constructor(opts: HostLoopOptions) {
 		this.resolveKey = opts.getApiKey ?? ((p) => process.env[`${p.toUpperCase()}_API_KEY`]);
 		this.hostSession = opts.session;
 		this.beforeAgentStart = opts.beforeAgentStart;
 		this.onUserTurn = opts.onUserTurn;
+		this.tracing = opts.tracing;
+		this.perTurnTracing = opts.perTurnTracing;
 
 		// streamFn：把当前 model 与透传的 options 交给 streamSimple，并补上 apiKey。
 		// Agent 在每轮调用时把 state.model 作为第一个参数传入，因此这里拿到的就是当前模型。
@@ -181,19 +210,58 @@ export class PiHostLoop {
 
 	/** 跑一轮：把 userText 作为 user 消息发起，返回最后一条 assistant 文本 */
 	async runTurn(userText: string): Promise<string> {
-		// model-router 桥接点（P10-50）：每轮开始前触发 before_agent_start，
-		// 路由决策经 pi.setModel 改写 state.model，本轮 LLM 调用即用新模型。
-		await this.beforeAgentStart?.(userText);
-		await this.agent.prompt(userText);
-		const all = this.agent.state.messages;
-		// 每轮把 agent 新增的消息增量落盘（线性追加语义）。
-		if (this.hostSession) {
-			this.hostSession.syncDelta(all.slice(this.hostSession.persistedMessageCount));
+		// 阶段 14（P14-87）：根 span 的生命周期 = 一次用户轮（只有宿主知道这个边界）。
+		// 子会话（蜂群视角）带 `parentSpanId` → 不走 `startRootSpan`（那会复用 trace 的
+		// 预留根 id，多个视角会撞同一个 spanId），改成一个挂视角树枝的普通子 span。
+		//
+		// ⚠️ 子会话的 span 名固定用 `TURN_SPAN_NAME`，**不能**用 `w.trace.name`：
+		// 子会话与父入口共用同一个 `TraceContext`（这正是"蜂群挂同一棵树"的实现方式），
+		// 于是 `trace.name` 是父入口的名字（如 `fiat.alert.handle`）——照抄会得到 5 个
+		// 同名 span，树里根本分不出哪根是子会话的轮次。
+		const w = this.perTurnTracing?.() ?? this.tracing;
+		const span = w
+			? w.parentSpanId
+				? w.tracer.startSpan(w.trace, TURN_SPAN_NAME, { parentSpanId: w.parentSpanId })
+				: w.tracer.startRootSpan(w.trace)
+			: undefined;
+		// 把这轮的宿主 span 登记进**会话级**接线槽：L1a trace-hook 在 `turn_start` 里读它，
+		// 让 `fiat.llm.turn` / `fiat.tool` 挂进这一轮——否则它们会变成 `fiat.turn` 的**兄弟**
+		// （根入口侥幸看不出，子会话直接塌树）。详见 `TracingWiring.turnSpanId`。
+		if (w && span?.spanId) w.turnSpanId = span.spanId;
+		span?.setInput(userText);
+		try {
+			// model-router 桥接点（P10-50）：每轮开始前触发 before_agent_start，
+			// 路由决策经 pi.setModel 改写 state.model，本轮 LLM 调用即用新模型。
+			await this.beforeAgentStart?.(userText);
+			await this.agent.prompt(userText);
+			const all = this.agent.state.messages;
+			// 每轮把 agent 新增的消息增量落盘（线性追加语义）。
+			if (this.hostSession) {
+				this.hostSession.syncDelta(all.slice(this.hostSession.persistedMessageCount));
+			}
+			const reply = lastAssistantText(all);
+			span?.setOutput(reply);
+			// provider 失败**不抛**（prompt 正常返回，只是 stopReason="error"）：必须自己看终态，
+			// 否则 trace 上会出现一条"成功"的假绿——那比没有追踪更糟。
+			const last = all.at(-1) as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+			if (last?.role === "assistant" && last.stopReason === "error") {
+				span?.setStatus("error", last.errorMessage ?? "provider returned error stopReason");
+			} else {
+				span?.setStatus("ok");
+			}
+			// 阶段 12：用户轮次计数点（§10.4）。放在最后——一轮已经完整结束，
+			// 此时 L1a 的 toolResults 也早已扇出完毕，宿主侧的汇合判定拿到的是完整数据。
+			this.onUserTurn?.();
+			return reply;
+		} catch (error) {
+			span?.setStatus("error", error instanceof Error ? error.message : String(error));
+			throw error;
+		} finally {
+			// end() 幂等；异常路径也要收口，否则 span 永远挂在树上
+			span?.end();
+			// 轮次已收口 → 槽位清空，避免下一轮（同一条 wiring 复用）读到上一轮的 span id
+			if (w && w.turnSpanId === span?.spanId) w.turnSpanId = undefined;
 		}
-		// 阶段 12：用户轮次计数点（§10.4）。放在最后——一轮已经完整结束，
-		// 此时 L1a 的 toolResults 也早已扇出完毕，宿主侧的汇合判定拿到的是完整数据。
-		this.onUserTurn?.();
-		return lastAssistantText(all);
 	}
 
 	/**

@@ -13,7 +13,16 @@ import type { AuditQuery, AuditReader } from "../audit/reader.ts";
 import type { ToolPolicy } from "../policy/engine.ts";
 import { intFlag, parseArgs } from "./args.ts";
 import type { ChatFactory } from "./chat.ts";
-import { allowedTools, HELP, renderAudit, renderSkills, renderTickets, renderTools } from "./commands.ts";
+import {
+	allowedTools,
+	HELP,
+	renderAudit,
+	renderSkills,
+	renderTickets,
+	renderTools,
+	renderTrace,
+	type TraceStatus,
+} from "./commands.ts";
 import type { SkillOps } from "./skills.ts";
 
 export interface DiagnosisInput {
@@ -46,6 +55,12 @@ export interface CliDeps {
 	 * 启动常驻进程并阻塞直至 SIGINT/SIGTERM；缺省时该命令明确提示。
 	 */
 	gateway?: GatewayLauncher;
+	/**
+	 * 阶段 14 / P14-89：全链路追踪状态（`fiat trace status`）。
+	 * **离线可跑**（零 Pi 依赖、零网络）——这是它存在的意义：排查「链路为什么没数据」
+	 * 时不希望再引入一个可能失败的外部依赖。缺省时该命令明确提示。
+	 */
+	trace?: () => TraceStatus;
 }
 
 /** 网关启动器：起 HTTP 服务并阻塞；返回进程退出码 */
@@ -84,6 +99,8 @@ export async function runCli(argv: readonly string[], deps: CliDeps, io: CliIo):
 			return cmdSkills(positional, flags, deps, io);
 		case "gateway":
 			return cmdGateway(flags, deps, io);
+		case "trace":
+			return cmdTrace(positional, deps, io);
 		default:
 			io.err(`未知命令：${command}\n\n${HELP}`);
 			return 1;
@@ -332,6 +349,24 @@ async function cmdSkills(
 
 function errText(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * 阶段 14 / P14-89：`fiat trace status` —— 追踪链路自检。
+ * 只读本地配置 + 进程内计数，**不打网络**（离线命令的既有纪律）。
+ */
+function cmdTrace(positional: readonly string[], deps: CliDeps, io: CliIo): number {
+	const sub = positional[0] ?? "status";
+	if (sub !== "status") {
+		io.err(`未知子命令：trace ${sub}\n\n可用：status`);
+		return 1;
+	}
+	if (!deps.trace) {
+		io.err("追踪未接入：CLI 启动时未装配追踪组件。");
+		return 1;
+	}
+	io.out(renderTrace(deps.trace()));
+	return 0;
 }
 
 /**
