@@ -35,6 +35,7 @@ import {
 } from "../src/server/evolution/types.ts";
 import { applyThenVerify } from "../src/server/evolution/verify.ts";
 import { LocalFiatClient } from "../src/server/fiat-tools/client.ts";
+import { sanitizeMemoryKey } from "../src/server/memory/identity.ts";
 import { LocalPolicyClient } from "../src/server/policy/client.ts";
 
 const sha256 = (s: string): string => createHash("sha256").update(s).digest("hex");
@@ -303,7 +304,7 @@ describe("P12-69/70 落盘路径", () => {
 		expect(skills.get("cashback-reconcile")).not.toBeNull();
 	});
 
-	it("记忆类提案：追加进 workspace/memory/YYYY-MM-DD.md，且不跑评测闸门", async () => {
+	it("记忆类提案：追加进 workspace/users/<proposer>/memory/YYYY-MM-DD.md，且不跑评测闸门", async () => {
 		const payload = { entries: ["返现表格列名为 id,amount"] };
 		const p = mkProposal({
 			proposalId: "prop-mem",
@@ -324,8 +325,11 @@ describe("P12-69/70 落盘路径", () => {
 		expect(r.apply.status).toBe("applied");
 		// 记忆不该进评测闸门（它不是技能）
 		expect(r.verify).toBeUndefined();
-		const file = join(tempDir, "memory", "2026-09-12.md");
+		// P15-103：② 路按身份物理分区 —— 目录由 proposer（本用例 = "u1"）决定，
+		// 不再落到全 workspace 共享的 `memory/`（那正是「同事能看到我的偏好」的成因）
+		const file = join(tempDir, "users", sanitizeMemoryKey(p.proposer), "memory", "2026-09-12.md");
 		expect(existsSync(file)).toBe(true);
+		expect(existsSync(join(tempDir, "memory"))).toBe(false);
 		const text = readFileSync(file, "utf-8");
 		expect(text).toContain("列名约定");
 		expect(text).toContain("返现表格列名为 id,amount");

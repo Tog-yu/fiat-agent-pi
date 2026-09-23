@@ -33,6 +33,7 @@ import { defineHostTools, type HostTool } from "../host/contracts.ts";
 import { createAuditHook } from "../host/l1a/audit-hook.ts";
 import { createEvalRecorder } from "../host/l1a/eval-recorder.ts";
 import type { EvolutionTrigger } from "../host/l1a/evolution-trigger.ts";
+import { createMemorySignal, type MemorySignal } from "../host/l1a/memory-signal.ts";
 import { createModelRouter, type ModelResolver, type RouteApplied } from "../host/l1a/model-router.ts";
 import { createPermissionGate } from "../host/l1a/permission-gate.ts";
 import { createTraceHook } from "../host/l1a/trace-hook.ts";
@@ -40,7 +41,14 @@ import { createAlertFanout } from "../host/l1b/alert-fanout.ts";
 import { createFiatTools } from "../host/l1b/fiat-tools.ts";
 import { createJobApply } from "../host/l1b/job-apply.ts";
 import { createMcpRagTools, type McpClientLike, type RagMcpConfig, type RagStatus } from "../host/l1b/mcp-rag.ts";
+import { createMemoryTools } from "../host/l1b/memory-tools.ts";
 import { createSkillTools } from "../host/l1b/skill-tools.ts";
+import { DEFAULT_MEMORY_CONFIG_PATH, loadMemoryConfig } from "../memory/config.ts";
+import { MemoryDrain } from "../memory/drain.ts";
+import { composeHotSegment } from "../memory/hot.ts";
+import { type MemoryIdentity, resolveMemoryIdentity } from "../memory/identity.ts";
+import { type MemoryClientRole, type MemoryLog, type MemoryReadChannel, MemoryStoreBridge } from "../memory/store.ts";
+import type { MemoryConfig } from "../memory/types.ts";
 import { loadModelPolicies, type ModelPolicies } from "../models/router.ts";
 import { LocalPolicyClient, type PolicyClient } from "../policy/client.ts";
 import { loadPolicies, type ToolPolicy } from "../policy/engine.ts";
@@ -133,6 +141,59 @@ export interface SessionFactoryOptions {
 	 *   ③ 把构建事实（角色 / 环境 / 注册工具数）交给 trace-hook 延迟落 span
 	 */
 	tracing?: TracingSource;
+	/**
+	 * 阶段 15（P15-97）：跨会话长期记忆接线。**缺省 undefined / 配置里 `enabled=false`
+	 * 时什么都不做** —— 零网络、零定时器、现有测试零改动（硬约束 7）。
+	 *
+	 * 与 `evolution` 的差别：那里 store 由调用方建好传进来（测试可以直接喂内存 store），
+	 * 这里**配置由本组合根加载** —— 因为「要不要注册」这件事必须以 `config/memory.yaml`
+	 * 的 `enabled` 为准，而让每个入口各自读一遍配置文件必然会有一处读法不同。
+	 */
+	memory?: MemoryFactoryOptions;
+}
+
+/** 记忆接线的**入口层**可调项（`SessionFactoryOptions.memory` 的形状，单独命名便于 chat.ts 复用） */
+export interface MemoryFactoryOptions {
+	/** 覆盖配置路径；缺省 `config/memory.yaml` */
+	configPath?: string;
+	/** 直接给配置（测试用；给了就跳过文件加载）。**要给完整的** `MemoryConfig` */
+	config?: MemoryConfig;
+	/** 注入 MCP client 工厂（测试 mock；生产用真实 SDK） */
+	clientFactory?: (cfg: RagMcpConfig, role: MemoryClientRole) => McpClientLike;
+	/** 熔断 / 连接状态回调（入口层通常与 `ragOnStatus` 接同一个 handler，合并展示） */
+	onStatus?: (status: RagStatus, detail: string) => void;
+	log?: MemoryLog;
+}
+
+/**
+ * 阶段 15（P15-97）：记忆接线包。**只在 `memory.enabled=true` 时存在**。
+ *
+ * 四个成员分给三类消费者，边界就是「谁能拿到什么」：
+ *
+ * | 成员 | 给谁 | 为什么 |
+ * |---|---|---|
+ * | `read` | `fiat_memory_search`（模型可见） | 只读通道：类型上**没有** write / forget |
+ * | `store` | 提取器（`MemoryExtractor.port`）+ CLI 维护命令 | 写通道。**绝不进工具表**（硬约束 1） |
+ * | `drain` | `ChatSession.flush()`（P15-97） | 退出前有界等待在飞写入（P15-106） |
+ * | `hotSegment` / `signal` | 宿主（`PiHostLoop` / REPL） | 热注入段 + 循环内工具步 |
+ *
+ * `identity` 一并带出**只为审计与日志**（collection 名是人肉核对时最直接的线索）。
+ */
+export interface MemoryWiring {
+	config: MemoryConfig;
+	identity: MemoryIdentity;
+	/** 只读检索通道（模型的唯一入口） */
+	read: MemoryReadChannel;
+	/** 读写桥（提取器 / 维护命令）。**不要**传给任何工具模块 */
+	store: MemoryStoreBridge;
+	/** 有界 drain（`flush()` 等它） */
+	drain: MemoryDrain;
+	/** 热注入段提供者（会话首轮算一次后**冻结**） */
+	hotSegment: () => Promise<string>;
+	/** L1a 工具步收集器（宿主席在轮末 `takeSteps()`） */
+	signal: MemorySignal;
+	/** 关桥（进程退出 / 测试收尾）；**永不抛** */
+	close: () => Promise<void>;
 }
 
 export interface SessionFactoryResult {
@@ -166,6 +227,12 @@ export interface SessionFactoryResult {
 	 * 那条路径由入口层用 `perTurnTracing` 直接给宿主，不经过这里。
 	 */
 	tracing?: TracingWiring;
+	/**
+	 * 阶段 15（P15-97）：记忆接线包。**缺省 undefined = 记忆未开**（零行为变化）。
+	 * 开记忆时本组合根已经：注册 `fiat_memory_search`（过闸门①）、装好 `memorySignal`
+	 * （L1a 尾部）、备好热注入提供者。提取器由入口层装配（它需要 Pi 运行时去起 fork）。
+	 */
+	memory?: MemoryWiring;
 }
 
 /**
@@ -320,17 +387,89 @@ export async function buildSession(
 
 	// 阶段 12（P12-65）：自进化段落 —— 技能索引 / 近期事实 / 角色运行约定，按此顺序追加在末尾。
 	// 记忆段是**提示层**：只注入事实，绝不把规则带进判定链（§10.3 铁律）。
+	//
+	// P15-102（设计文档 §3-L1）：记忆层此前是**唯一没接身份的消费点** —— 闸门② / 审计 /
+	// fiatTools / evalRecorder 都显式传了 `subject.user`，只有这里没有，于是 `user` scope
+	// 会退化成「所有人都是 cli」，隔离在纸面上成立、运行时失效。现在按会话主体派生
+	// `MemoryIdentity` 再读（P15-103 的 per-user 目录因此才有意义）。
+	//
+	// identity 由本组合根**内部**派生，不从 opts 传入：`resolveMemoryIdentity` 是唯一构造点，
+	// 让它从外部进来就等于多开一个可能构造错的口子（设计文档 §9-1）。
+	const memoryStore = opts.evolution?.memoryStore;
+	const memoryIdentity = memoryStore ? resolveMemoryIdentity(subject) : undefined;
+
 	const evolutionPrompt = opts.evolution
 		? composeSystemPrompt("", {
 				skills: opts.evolution.skillStore.index(),
-				...(opts.evolution.memoryStore
-					? { memory: opts.evolution.memoryStore.recentFacts(opts.evolution.memoryDays ?? 3) }
+				...(memoryStore && memoryIdentity
+					? { memory: memoryStore.recentFacts(memoryIdentity, opts.evolution.memoryDays ?? 3) }
 					: {}),
-				...(opts.evolution.includeRoleFacts && opts.evolution.memoryStore
-					? { roleFacts: opts.evolution.memoryStore.roleFacts(subject.user.role) }
+				...(opts.evolution.includeRoleFacts && memoryStore
+					? { roleFacts: memoryStore.roleFacts(subject.user.role) }
 					: {}),
 			})
 		: "";
+
+	/**
+	 * 记忆接线。**只有 `config/memory.yaml` 的 `enabled=true` 才返回东西**。
+	 *
+	 * 三条刻意的顺序：
+	 *
+	 *   ① `enabled` **先判**。关记忆时连 `resolveMemoryIdentity` 都不跑 —— 那一步有
+	 *      哨兵守卫（P15-104），多租户下会**抛**。关记忆就不该有这条抛点：
+	 *      「没开记忆的单租户本地部署」必须与以前字节级一致（硬约束 7）。
+	 *   ② 桥（含两个 MCP client）**惰性连接**：构造不发网络请求，第一次 `search` /
+	 *      `write` 才 connect。所以这里多构造一个对象对「没用到记忆的会话」零成本。
+	 *   ③ `signal` 与 `drain` 与桥**同生命周期**（同一个 wiring 包）—— 让别处
+	 *      「记得把 drain 挂上 flush」这种纪律性的东西变成「拿到 wiring 就都拿到了」。
+	 */
+	function buildMemoryWiring(): MemoryWiring | undefined {
+		const cfg = opts.memory?.config ?? loadMemoryConfig(opts.memory?.configPath ?? DEFAULT_MEMORY_CONFIG_PATH);
+		if (!cfg.enabled) return undefined;
+
+		const identity = resolveMemoryIdentity(subject);
+		const bridge = new MemoryStoreBridge({
+			rag: ragConfig,
+			memory: cfg,
+			identity,
+			...(opts.memory?.clientFactory ? { clientFactory: opts.memory.clientFactory } : {}),
+			...(opts.memory?.onStatus ? { onStatus: opts.memory.onStatus } : {}),
+			...(opts.memory?.log ? { log: opts.memory.log } : {}),
+			// 阶段 14：检索 / 写入各出一个 `fiat.memory.*` span（父 span 由 traced 的 mcp 桥接）
+			...(opts.tracing ? { tracing: opts.tracing } : {}),
+			// 阶段 15（P15-98）：写入 / 遗忘**双写审计** —— 这两条路都不是模型工具调用，
+			// 走不到 audit-hook，必须显式补（否则本阶段最有合规意义的动作在审计里查不到）
+			audit: {
+				audit: auditClient,
+				user: subject.user,
+				environment: subject.environment,
+				sessionId,
+				...(opts.memory?.log ? { log: opts.memory.log } : {}),
+			},
+		});
+		return {
+			config: cfg,
+			identity,
+			read: bridge.readChannel(),
+			store: bridge,
+			drain: new MemoryDrain({ ...(opts.memory?.log ? { log: opts.memory.log } : {}) }),
+			hotSegment: () =>
+				composeHotSegment(bridge.readChannel(), cfg, { ...(opts.memory?.log ? { log: opts.memory.log } : {}) }),
+			signal: createMemorySignal(),
+			close: () => bridge.close(),
+		};
+	}
+
+	// ── 阶段 15（P15-97）：跨会话长期记忆 ────────────────────────────────────────────
+	//
+	// 装配顺序刻意放在**最后**：注册工具要过闸门①（`allowedTools` 依赖 policies 与
+	// subject），挂 L1a 要排在 trace-hook 之后（位置契约），而热注入要等 `evolutionPrompt`
+	// 定稿（热注入段追加在它之后）。
+	const memory = buildMemoryWiring();
+	if (memory) {
+		hostTools.push(...createMemoryTools({ channel: memory.read, allowedTools }));
+		factories.push(memory.signal.factory); // 位置契约尾部：...traceHook?, ...memorySignal?
+	}
 
 	// 阶段 14：把「构建时刻的接线」求值一次给调用方。函数形态的取值器此刻多半是 undefined
 	// （chat 是 per-turn trace，首轮还没开始）——那条路径由入口层用 `perTurnTracing` 自己给宿主。
@@ -348,5 +487,6 @@ export async function buildSession(
 		hostTools,
 		evolutionPrompt,
 		...(buildTimeTracing ? { tracing: buildTimeTracing } : {}),
+		...(memory ? { memory } : {}),
 	};
 }

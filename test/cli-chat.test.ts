@@ -50,7 +50,8 @@ describe("P9-49 chat 命令分发（runCli）", () => {
 				seen.push(input);
 				return { ok: true, reply: `echo:${input}` };
 			},
-			dispose: () => {},
+			dispose: async () => {},
+			flush: async () => {},
 		});
 		const { io, out } = capture();
 		const code = await runCli(["chat", "查一下", "返现规则"], baseDeps({ chat }), io);
@@ -73,7 +74,8 @@ describe("P9-49 chat 命令分发（runCli）", () => {
 		const chat: ChatFactory = async () => ({
 			sessionId: "sess-chat-2",
 			turn: async () => ({ ok: false, reply: "", error: "provider error stopReason" }),
-			dispose: () => {},
+			dispose: async () => {},
+			flush: async () => {},
 		});
 		const { io, out } = capture();
 		const code = await runCli(["chat", "hi"], baseDeps({ chat }), io);
@@ -135,7 +137,7 @@ describe("makeChat 全链路（faux provider，真实 buildSession + PiHostLoop�
 		const r = await session.turn("查一下返现规则");
 		expect(r.ok).toBe(true);
 		expect(r.reply).toBe("返现规则是……（faux 回复）");
-		session.dispose();
+		await session.dispose();
 		// 显式放宽超时：`makeChat` 的工厂体里**动态 import** Pi 运行时（装配纪律：
 		// 离线 CLI 命令不落地 Pi 模块），vitest 把这次冷加载算进用例耗时
 		// （本机实测首次 ~29s，默认 5s 必然假红）。断言一字未改。
@@ -157,7 +159,7 @@ describe("makeChat 全链路（faux provider，真实 buildSession + PiHostLoop�
 		const r = await session.turn("你好");
 		expect(r.ok).toBe(true);
 		expect(r.reply).toBe("本轮不调工具，直接回答。");
-		session.dispose();
+		await session.dispose();
 		// 同上：第二个用例复用已加载的模块，通常几秒内结束；给足余量避免并行跑时被 CPU 争抢拖垮
 	}, 90_000);
 });

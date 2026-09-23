@@ -12,8 +12,15 @@
  *     span 一次成型——所以"开始 span"是内存态，只有 `end()` 才入队。
  */
 
-/** 入口类型：决定采样档位 + trace tags 的第一位 */
-export type TraceKind = "chat" | "gateway" | "diagnose" | "ci" | "evolution";
+/**
+ * 入口类型：决定采样档位 + trace tags 的第一位。
+ *
+ * `memory` 是阶段 15（P15-97）新增的：记忆提取 fork 与评审 fork 一样**独立成一条 trace**
+ * （它是一次完整的 LLM 会话，塞进主会话的 trace 会让「这轮用户请求花了多少」被提取污染）。
+ * 与 `evolution` 分开而不是复用，因为两者的**成本归属**完全不同：
+ * 「自进化花了多少钱」与「记忆提取花了多少钱」是两个要分别回答的问题。
+ */
+export type TraceKind = "chat" | "gateway" | "diagnose" | "ci" | "evolution" | "memory";
 
 /** OTLP span kind（内部阶段 / 上游调用 / 被调用 / 生产者 / 消费者） */
 export type SpanKind = "internal" | "server" | "client" | "producer" | "consumer";
@@ -257,6 +264,6 @@ export const DEFAULT_TRACING_CONFIG: TracingConfig = {
 	serviceName: "fiat-agent",
 	captureContent: "redacted",
 	redactKeys: ["prompt", "password", "token", "api_key", "id_card", "bank_card", "card_no"],
-	sampleRate: { chat: 1, gateway: 1, diagnose: 1, ci: 1, evolution: 1 },
+	sampleRate: { chat: 1, gateway: 1, diagnose: 1, ci: 1, evolution: 1, memory: 1 },
 	batch: { maxQueue: 2048, maxBatch: 64, flushIntervalMs: 2000, maxRetries: 2, timeoutMs: 5000 },
 };

@@ -27,7 +27,7 @@ export class TracingConfigError extends Error {
 	}
 }
 
-export const TRACE_KINDS: readonly TraceKind[] = ["chat", "gateway", "diagnose", "ci", "evolution"];
+export const TRACE_KINDS: readonly TraceKind[] = ["chat", "gateway", "diagnose", "ci", "evolution", "memory"];
 const CAPTURE_MODES: readonly CaptureContent[] = ["off", "redacted", "full"];
 
 type Env = Record<string, string | undefined>;

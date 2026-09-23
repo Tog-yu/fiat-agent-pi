@@ -124,6 +124,18 @@ export interface HostLoopOptions {
 	 * 预留根 spanId → 同一条 trace 里出现多个同 id 的根 span（OTLP 侧直接算脏数据）。
 	 */
 	perTurnTracing?: () => TracingWiring | undefined;
+	/**
+	 * 阶段 15（P15-97）：**热注入段**提供者（§15.3 决策 C 第二轨）。
+	 * 会话**首轮**算一次并冻结，追加在 `systemPrompt` 之后。缺省 undefined = 不注入。
+	 *
+	 * 为什么冻结必须在这里落地、而不是在组合根：组合根是**同步**的（`buildSession`
+	 * 不 await 任何东西），而热注入要一次 RAG 检索（异步）。若改成「每轮算一次」，
+	 * systemPrompt 就会在会话中途变化 —— 那正是 §15.0 第 2 条要点出的 prefix cache 硬伤。
+	 *
+	 * 提供者**永不抛**（`composeHotSegment` 保证）；即便它抛了，本类也只当作空段 ——
+	 * 热注入是锦上添花，不该让会话起不来。
+	 */
+	hotSegment?: () => Promise<string>;
 }
 
 /** 取最后一条 assistant 消息的文本作为该轮回复 */
@@ -160,6 +172,9 @@ export class PiHostLoop {
 	private readonly onUserTurn?: () => void;
 	private readonly tracing?: TracingWiring;
 	private readonly perTurnTracing?: () => TracingWiring | undefined;
+	private readonly hotSegment?: () => Promise<string>;
+	/** 热注入只做一次（冻结）。**先置位再 await** —— 并发 runTurn 不该各算一份 */
+	private hotApplied = false;
 
 	constructor(opts: HostLoopOptions) {
 		this.resolveKey = opts.getApiKey ?? ((p) => process.env[`${p.toUpperCase()}_API_KEY`]);
@@ -168,6 +183,7 @@ export class PiHostLoop {
 		this.onUserTurn = opts.onUserTurn;
 		this.tracing = opts.tracing;
 		this.perTurnTracing = opts.perTurnTracing;
+		this.hotSegment = opts.hotSegment;
 
 		// streamFn：把当前 model 与透传的 options 交给 streamSimple，并补上 apiKey。
 		// Agent 在每轮调用时把 state.model 作为第一个参数传入，因此这里拿到的就是当前模型。
@@ -208,6 +224,35 @@ export class PiHostLoop {
 		if (opts.tools) registerTools(this.agent, opts.tools);
 	}
 
+	/**
+	 * 阶段 15（P15-97）：热注入段**只注入一次**（会话级冻结）。
+	 *
+	 * 三条刻意的处置：
+	 *
+	 *   ① **先置位再 await**。否则两个并发的 `runTurn` 会各算一份，后写的覆盖先写的
+	 *      —— 结果一样，但白跑一次 RAG 检索。
+	 *   ② **抛错也置位**。冻结的语义是「只算一次」；失败后重试会让 systemPrompt
+	 *      在会话中途从空变成有内容 —— 那正是冻结要避免的事。这一次会话少了热注入，
+	 *      但工具检索照常可用（降级损失有界）。
+	 *   ③ **拼在末尾**（`base\n\nseg`），不插队。与 `evolutionPrompt` 的口径一致：
+	 *      追加段的顺序稳定，prefix cache 才稳。
+	 */
+	private async applyHotSegmentOnce(): Promise<void> {
+		if (this.hotApplied) return;
+		this.hotApplied = true;
+		if (!this.hotSegment) return;
+
+		let segment = "";
+		try {
+			segment = await this.hotSegment();
+		} catch {
+			segment = ""; // provider 已自保证不抛；这里是最后一道，静默即空段
+		}
+		if (!segment) return;
+		const base = this.agent.state.systemPrompt;
+		this.agent.state.systemPrompt = base ? `${base}\n\n${segment}` : segment;
+	}
+
 	/** 跑一轮：把 userText 作为 user 消息发起，返回最后一条 assistant 文本 */
 	async runTurn(userText: string): Promise<string> {
 		// 阶段 14（P14-87）：根 span 的生命周期 = 一次用户轮（只有宿主知道这个边界）。
@@ -230,6 +275,11 @@ export class PiHostLoop {
 		if (w && span?.spanId) w.turnSpanId = span.spanId;
 		span?.setInput(userText);
 		try {
+			// 阶段 15（P15-97）：热注入**首轮算一次并冻结**，追加在 systemPrompt 之后。
+			// 放在 beforeAgentStart 之前：model-router 的 `setModel` 会在那一步跑，
+			// 而系统提示词与模型无关，先注入可以让这一轮的请求一次成型。
+			await this.applyHotSegmentOnce();
+
 			// model-router 桥接点（P10-50）：每轮开始前触发 before_agent_start，
 			// 路由决策经 pi.setModel 改写 state.model，本轮 LLM 调用即用新模型。
 			await this.beforeAgentStart?.(userText);

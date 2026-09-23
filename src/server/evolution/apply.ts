@@ -26,6 +26,7 @@
  */
 
 import type { AuditClient, AuditOutcome } from "../audit/client.ts";
+import { resolveMemoryIdentity } from "../memory/identity.ts";
 import type { MemoryStore } from "./memoryStore.ts";
 import type { ProposalStore } from "./proposalStore.ts";
 import type { SkillStore } from "./skillStore.ts";
@@ -97,7 +98,14 @@ export async function applyProposal(proposalId: string, decidedBy: string, deps:
 			}).path;
 		} else if (proposal.kind === "memory") {
 			const p = proposal.payload as Extract<ProposalPayload, { entries: string[] }>;
-			appliedPath = deps.memory.appendFacts({ title: proposal.title, entries: p.entries }, now());
+			// P15-103：记忆落在**蒸出它的那个人**名下 —— 用 `proposal.proposer`（提案生成时记下的
+			// 触发会话 userId，types.ts:121），而不是 apply 那一刻的会话主体：审批落盘可能发生在
+			// 别人的会话里（approval.ts:132 传的是 `args.approver.id`），用会话主体会写错分区。
+			appliedPath = deps.memory.appendFacts(
+				resolveMemoryIdentity({ user: { id: proposal.proposer } }),
+				{ title: proposal.title, entries: p.entries },
+				now(),
+			);
 		} else {
 			const p = proposal.payload as Extract<ProposalPayload, { role: string; entries: string[] }>;
 			appliedPath = deps.memory.appendRoleFacts(p.role, { title: proposal.title, entries: p.entries }, now());

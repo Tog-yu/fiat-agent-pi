@@ -90,3 +90,22 @@ policies:
     allowed_roles: [oncall, ops, viewer]
     allowed_environments: [dev, staging, prod]
     allowed_scopes: [skill_read]
+
+  # 阶段 15（P15-92）：检索跨会话长期记忆（注册名 fiat_memory_search，policyToolName 剥前缀）。
+  #
+  # ⚠️ **这条必须加**：`policy/engine.ts:83` 对未知工具**默认拒绝**（fail-closed）——
+  #    新工具漏配策略会静默全灭（阶段 13 已踩过同类坑）。
+  #
+  # 为什么是 L1 只读：`scope` / `key` 由宿主闭包注入、**不出现在工具 schema 里**
+  # （§15.14 硬约束 3），模型既看不到也改不了隔离边界，因此它没有越权读取他人记忆的路径。
+  # 硬约束 1 也保证主会话**永不出现写工具** —— 记忆写入只能由 L2 确定性代码发起。
+  #
+  # ⚠️ 刻意**不给** `collection_scopes`：`engine.ts:62` 的 collectionVerdict 在角色配了
+  #    `collection_scopes` 且入参没有 `collection` 时会**改写 input 注入 collection**。
+  #    而本工具的隔离边界是 scope+key、且这两个字段根本不在 schema 里 ——
+  #    多注入一个 collection 字段既无意义，又会给「谁决定分区」留下第二个说法。
+  - tool: memory_search             # 检索跨会话记忆（注册名 fiat_memory_search）
+    risk_level: L1
+    allowed_roles: [oncall, ops, viewer]
+    allowed_environments: [dev, staging, prod]
+    allowed_scopes: [memory_read]

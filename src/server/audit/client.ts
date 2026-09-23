@@ -16,6 +16,10 @@ import type { FiatUser } from "../policy/engine.ts";
  * 阶段 12（P12-69）扩了四个自进化取值——**只增不改**，与「审计只追加」的语义一致：
  * 自进化本身必须可审计（§10.9 双写口径），而它既不是工具调用也不是业务工单，
  * 硬塞进 `applied` / `ticket_approved` 会让审计查询分不清「谁改了自己的行为」。
+ *
+ * 阶段 15（P15-98）同理加三个记忆取值：记忆写入由 L2 代码发起、**不是工具调用**，
+ * 走不到 `audit-hook`；不显式补一条，本阶段最有合规意义的动作（「往此后所有会话的
+ * 注入面写了一条东西」）就会是审计里唯一查不到的事。
  */
 export type AuditOutcome =
 	| "allowed"
@@ -28,7 +32,10 @@ export type AuditOutcome =
 	| "evolution_proposed"
 	| "evolution_applied"
 	| "evolution_rejected"
-	| "evolution_rolled_back";
+	| "evolution_rolled_back"
+	| "memory_written"
+	| "memory_write_failed"
+	| "memory_forgotten";
 
 export interface AuditRecord {
 	ts: string;

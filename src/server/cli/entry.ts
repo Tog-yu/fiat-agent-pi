@@ -13,6 +13,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -32,6 +33,9 @@ import {
 } from "../../../src/server/evolution/proposalStore.ts";
 import { SkillStore } from "../../../src/server/evolution/skillStore.ts";
 import { type FiatToolClient, LocalFiatClient } from "../../../src/server/fiat-tools/client.ts";
+import { ragConfigFromEnv } from "../../../src/server/host/l1b/mcp-rag-transport.ts";
+import { resolveIdentity } from "../../../src/server/identity/resolver.ts";
+import { resolveMemoryIdentity } from "../../../src/server/memory/identity.ts";
 import { loadModelPolicies, piApiName } from "../../../src/server/models/router.ts";
 import { LocalPolicyClient, type PolicyClient } from "../../../src/server/policy/client.ts";
 import { loadPolicies, policyToolName } from "../../../src/server/policy/engine.ts";
@@ -44,9 +48,38 @@ import type { Tracer, TracingConfig, TracingWiring } from "../../../src/server/t
 import { type EvolutionWiring, makeChat } from "./chat.ts";
 import type { TraceStatus } from "./commands.ts";
 import { type CliDeps, type DiagnosisInput, type GatewayLauncher, runCli } from "./index.ts";
+import { createMemoryOps } from "./memory.ts";
 import { createSkillOps } from "./skills.ts";
 
 const DEFAULT_GATEWAY_PATH = fileURLToPath(new URL("../../../config/gateway.yaml", import.meta.url));
+
+/**
+ * 零依赖加载 `.env.local` / `.env`（项目根，已被 gitignore），仅填充未定义的变量。
+ * 用途：把本地开发用的密钥 / FIAT_MODEL 常驻，避免每次 `fiat` 命令都手敲 env。
+ * 不抛错、不覆盖已存在的变量、不读取任何非本地文件。
+ */
+function loadLocalEnv(): void {
+	const root = fileURLToPath(new URL("../../../", import.meta.url));
+	for (const name of [".env.local", ".env"]) {
+		let text: string;
+		try {
+			text = readFileSync(join(root, name), "utf-8");
+		} catch {
+			continue;
+		}
+		for (const line of text.split("\n")) {
+			const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+			if (!m) continue;
+			const key = m[1];
+			let val = m[2];
+			if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+				val = val.slice(1, -1);
+			}
+			if (process.env[key] === undefined) process.env[key] = val;
+		}
+	}
+}
+loadLocalEnv();
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_CTX = 128_000;
@@ -60,13 +93,18 @@ const DEFAULT_EVOLUTION_PATH = fileURLToPath(new URL("../../../config/evolution.
 const DEFAULT_EVAL_CASES_PATH = fileURLToPath(new URL("../../../config/eval_cases.yaml", import.meta.url));
 /** 阶段 14：追踪配置（人写锚点；`enabled` 缺省 false，关时零网络零定时器） */
 const DEFAULT_TRACING_PATH = fileURLToPath(new URL("../../../config/tracing.yaml", import.meta.url));
+/** 阶段 15：记忆配置（人写锚点；`enabled` 缺省 false，关时零网络零定时器） */
+const DEFAULT_MEMORY_CONFIG_PATH = fileURLToPath(new URL("../../../config/memory.yaml", import.meta.url));
 /** 技能库 / 记忆目录的宿主根（与 chat 的 cwd 同一处） */
 const WORKSPACE_DIR = fileURLToPath(new URL("../../../workspace", import.meta.url));
 
 function cliSubject(): SessionSubject {
 	const role = process.env.FIAT_ROLE ?? "ops";
 	const env = process.env.FIAT_ENV ?? "dev";
-	return { user: { id: "cli", role }, environment: env };
+	// P15-101：身份经可信解析层（不是裸读环境变量）。多租户模式下解析不出身份会抛
+	// `IdentityUnavailableError`，由 `main()` 的 catch 收口并 exit 1 —— **拒绝会话**，
+	// 而不是退回 "cli" 让所有人的记忆混装。
+	return { user: { id: resolveIdentity().id, role }, environment: env };
 }
 
 /** 阶段 14：进程级追踪三件套（配置 / 上报 client / tracer），全进程共用一份 */
@@ -155,6 +193,17 @@ function bootstrapCliDeps(): { deps: CliDeps; tracing: CliTracing } {
 			skills: createSkillOps({ skills: skillStore, proposals, config: evolutionConfig }),
 			gateway: makeGateway(policiesPath, auditClient, tracing),
 			trace: () => buildTraceStatus(tracing),
+			memory: createMemoryOps({
+				configPath: DEFAULT_MEMORY_CONFIG_PATH,
+				rag: ragConfigFromEnv(),
+				// `cliSubject()` 里的 `resolveIdentity()` 在多租户下**会抛** —— 那是刻意让它
+				// 抛在这里、由 `cli/memory.ts` 收进 `stats` 的报告字段里（见该文件顶部 ①）。
+				// 若在这里当场求值，`fiat memory stats`（排查身份问题的命令）会先自己挂掉。
+				identity: (scope) => resolveMemoryIdentity(cliSubject(), { scope }),
+				log: (level, message, detail) => {
+					process.stderr.write(`[memory:${level}] ${message}${detail ? ` ${JSON.stringify(detail)}` : ""}\n`);
+				},
+			}),
 		},
 		tracing,
 	};
@@ -446,6 +495,11 @@ async function main(): Promise<void> {
 		// 阶段 14（P14-89）：退出前把待发 span 冲出去。上报定时器是 unref 过的
 		// （不能被它钉住进程），代价就是**不显式 flush 会丢最后一批** —— 那恰好是本次命令的收尾链路。
 		await tracing.client.shutdown();
+		// 阶段 15（P15-99）：记忆维护命令可能建过 MCP 连接（`list`/`search`/`forget`）。
+		// 一次性进程本来退出就会回收，但**显式关**能让子进程（stdio transport）正常收尾 ——
+		// 否则 RAG server 会以「对端断开」的形态退出，日志里留一堆无谓的报错。
+		// `close()` 永不抛（与 `MemoryStoreBridge.close()` 同口径）。
+		await deps.memory?.close();
 		process.exit(code);
 	} catch (e) {
 		process.stderr.write(`CLI 启动失败：${e instanceof Error ? e.message : String(e)}\n`);

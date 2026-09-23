@@ -732,6 +732,561 @@ tracing:
 
 ---
 
+### 阶段 15：跨会话长期记忆（RAG 检索式，参考 Claude Code）
+
+> 方向确认于 2026-09-23。触发背景：阶段 12 的「记忆」只有本地 md 文件（`workspace/memory/YYYY-MM-DD.md`，`evolution/memoryStore.ts:73`），**无检索、无分类、无 scope 隔离**；读取靠 `MemoryStore.recentFacts(maxDays=3, maxChars=1200)`（`memoryStore.ts:106`）**全量注入近 3 天**。三条硬伤：
+>
+> 1. **召回靠时间窗而非相关性**——三个月前澄清的返现口径，今天再问，它不在「最近 3 天」里，模型根本看不到。记忆越久越没用。
+> 2. **每轮都在改 systemPrompt**——按天文件随对话增长，注入文本每轮都变 → **prefix cache 每轮打掉**，与 P12-65「按 name 稳定排序、避免打掉 prefix cache」的初衷自相矛盾。
+> 3. **无分类 / 无 scope**——用户偏好、对 AI 的纠正、项目计划、外部指针混在同一条流水里；也没有 per-user 边界（多租户问询时无法回答"我的偏好会不会被同事看到"）。
+>
+> 本阶段补上「**跨会话、按需检索、分类隔离**」的长期记忆，并把写入侧做成**确定性代码说了算**的链路。
+
+验收：`FIAT_MEMORY=1` 时——① 一场会话里出现「以后都用 X 而不是 Y」这类纠正 → 轮末异步 fork 产出候选 → **确定性落库**到 RAG（向量 + BM25 双索引），主会话**零阻塞、零写工具可见**；② 新会话提问时模型经 `fiat_memory_search` 召回到那条记忆，并在回答里带 id 引用；③ `user` scope 记忆**跨 user 检索不到**（隔离测试为必测项）；④ 写入前一律脱敏（PII 正则兜底）、写入/遗忘**审计双写但正文不入审计、不入 span**；⑤ `FIAT_MEMORY` 未设（缺省）→ 零网络、零行为变化、现有测试零改动。`npm run check` + `npm test` 全绿（新增 memory 用例）。
+
+设计依据（**均为官方文档实读，非推测**）：
+- Claude Code 官方 memory 文档（`code.claude.com/docs/en/memory`）：CLAUDE.md（人写，managed / user / project / local 四层，启动时自宽到窄加载）+ auto memory（Claude 自写，per-repository、跨 worktree 共享，**每次会话只加载前 200 行或 25KB**）；以及最关键的一句官方定调——**「Claude 把它们当 context，不是强制配置；要真正阻断一个动作必须用 PreToolUse hook」**。
+- Anthropic memory tool 规范（`platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool`）：`memory_20250818` 提供 `/memories` 目录 + 6 个命令（`view`/`create`/`str_replace`/`insert`/`delete`/`rename`），**handler 由客户端实现**（存储后端自选），且**路径穿越防护是强制项**（拒绝 `/memories` 之外的一切路径）。
+- 本仓既有同构物：阶段 12 的 fork 八条硬约束（`evolution/reviewer.ts` 文件头）、`evolution/slice.ts:64` 的 `redact()` 二次脱敏、`evolution/policy.ts` 的「**提示词是劝、正则才是拦**」双轨。
+
+---
+
+#### 15.1 关键决策 A：学 Claude Code 的一半，另一半明确不学
+
+| 维度 | Claude Code | 本阶段 | 为什么不一样 |
+|---|---|---|---|
+| 人写锚点 | CLAUDE.md 四层（managed / user / project / local）+ `.claude/rules/` 按路径限定 | **已有**：`workspace/AGENTS.md` + `config/*.yaml`（P10-51 / 各阶段人写锚点） | 同构，不重复造 |
+| 机器写记忆 | auto memory（per-repo，本地文件） | RAG（向量 + BM25），**带 scope** | 要跨工作区边界；要按相关性召回；要 per-user 隔离 |
+| 读取方式 | **全量注入**（前 200 行 / 25KB） | **工具按需检索**为主 + 少量热注入 | 注入式没有"相关性"概念；记忆上千条后 25KB 只能装下最新的，等于回到时间窗 |
+| 存储后端 | 本地文件（`.memdir` / `/memories`） | RAG MCP（现有 server，**只加 3 个工具**） | 复用已有 hybrid search + RRF + rerank，**零新建检索栈** |
+| 写入时机/发起方 | 会话中**模型自己**调 `create` | **轮末异步 fork**，模型只产候选，落库在 L2 | 见决策 B（持久化注入面） |
+| 定位 | 「context，不是强制配置」 | 「**记忆不是规则源**」（阶段 12 铁律 4 沿用） | 官方定调与我们的铁律同向，可交叉引用 |
+
+**一句话**：Claude Code 的记忆是「**文件 + 全量注入**」，我们的是「**RAG + 检索 + 隔离**」；它证明了两件事——① 机器自写记忆这条路走得通；② 记忆必须明确「只是 context」，否则会与真实权限配置混淆。第二点直接支撑我们的铁律。
+
+#### 15.2 关键决策 B：写入侧**不给主会话任何写工具**
+
+「在会话中让模型自己 `create` 记忆文件」（Claude Code / Anthropic memory tool 的做法）在本项目**不可接受**，三条理由：
+
+1. **持久化注入面**：写进去的内容在**以后每一次**会话都会被读回并进上下文。一次被 prompt injection 诱导的写入，影响面是「此后所有会话」，而不是「这一次」——比 `tool_call` block 那类「只在当轮生效」的风险高一个量级。
+2. **主会话污染**：写记忆需要"刚发生了什么"的上下文，等于把主 transcript 再喂一遍做二次加工，token 与注意力都被占；而主会话的职责是回答用户。
+3. **归类不可信**：让模型自己决定「这条是 user 还是 project」，等于把 **scope 判定（决定谁能看到）交给 LLM**——scope 是隔离边界，必须代码说了算。
+
+所以链路是（与阶段 12 完全同构，「LLM 只产候选，代码决定落盘」）：
+
+```text
+主会话（只读记忆，工具表里没有写工具）
+   │  onUserTurn（host/loop.ts:254，已有钩子，零新增）
+   ▼
+L2 确定性预筛（纯函数，零 LLM）            ← 新增 memory/policy.ts
+   │  信号检测 / 长度上限 / 敏感扫描 / 与权威三源重复检测
+   ▼
+轮末 fork（HostSession.inMemory、白名单只给 submit 工具、超时、递归防护、永不抛）  ← 新增 memory/extractor.ts
+   │  产出**结构化 JSON**（kind + text + evidence），不是自由文本
+   ▼
+L2 确定性落库（schema 校验 → 脱敏 → supersede 判定 → 调 MCP）  ← 新增 memory/store.ts
+   │  memory_store（RAG 侧新增 MCP 工具）→ 向量 + BM25 双写
+   ▼
+审计双写 + trace span（**正文不入审计、不入 span**）
+```
+
+> **LLM 只回答「值不值得记、记什么」，不回答「写到哪、能不能写、给谁看」。**
+
+#### 15.3 关键决策 C：检索侧双轨——热注入一小段，其余全走工具
+
+要求里的主轨「MCP 注册为工具、模型自主判断是否调用」**采纳**。但只做这一轨会留着 15.0 的第 2 条硬伤（每轮 systemPrompt 变、prefix cache 全废），所以补一轨：
+
+| 轨 | 内容 | 进 systemPrompt？ | prefix cache | 谁决定 |
+|---|---|---|---|---|
+| **热**（稳定偏好段） | 仅 `user` / `feedback` 两类、高置信、未 `superseded`、长度受限的前 N 条（`user` 为主，`feedback` 按最近优先；已晋升的浓缩 `user` 优先于同族 `feedback`，见 15.5） | 是，但**只在会话首轮算一次、全会话冻结** | **保住**（同一会话内字节不变） | 代码确定性筛选 |
+| **冷**（工具检索） | `reference` / `project` 及全部历史条目 | 否 | 零影响 | **模型自主调用** |
+
+「**会话级冻结**」是关键：现有 `recentFacts()` 每轮重算 → 每轮 systemPrompt 变 → cache 全废。把热注入定稿在会话创建时（`HostResources.systemPrompt`，`host/resources.ts:79`），记忆与 cache 就不再互斥。
+
+#### 15.4 关键决策 D：记忆与 RAG 知识库**物理隔离**（不同 collection）
+
+RAG 知识库是**权威事实源**（人维护、只读、带引用）；记忆是**派生层**（机器写、可撤销、无权威性）。若混在同一 collection：
+
+- 一条 3 个月前机器写的过时口径，会与权威文档在同一个 hybrid search 里**同权竞争**；
+- 且**没人能分辨哪条是权威**——检索结果里两者长得一样。
+
+因此：
+- 知识库 collection 现状不动（`knowledge_hub` 等）；
+- 记忆 collection：`fiat_memory_<scope>_<key>`（如 `fiat_memory_user_u_1024`、`fiat_memory_repo_fiat-agent-pi`）；
+- **检索结果不合并**：`fiat_memory_search` 只搜记忆 collection，`mcp_rag_query_*` 只搜知识库。两个工具在提示词里分工写明——「事实依据查知识库，历史澄清查记忆」。
+
+#### 15.5 四类记忆的口径：`user` / `feedback` / `project` / `reference`
+
+> **本节分类口径由 tog 于 2026-09-23 拍板**，取代初稿的 `user / project / reference / performance` 四分法。**`performance` 这个名字撤销**——它原本是想表达「实现口径」（如「循环用 `for` 不用迭代器」），在新口径下这类记忆**整体归入 `feedback`**：因为它们的成因几乎都是一次具体的纠正或确认，而不是孤立的偏好陈述。
+
+四类不是按「内容主题」切的，而是按「**这条记忆是关于谁的、被什么触发的**」切。归类飘移的代价不是"分类不整齐"，而是**按 kind 过滤失效 + 热注入段塞错东西**，所以每类都必须有一条 LLM 能照做的判定线、并配一个反例。
+
+| kind | 定义 | 判定线（LLM 照着选） | 例子（tog 给定口径） | 典型 scope | 时效 |
+|---|---|---|---|---|---|
+| `user` | 用户角色、偏好、技能水平 | 关于**人的稳态事实**，**无**「上一轮 / 这次」的时间锚点 | 「偏好函数式风格」；「是后端工程师」；「tog 要结论先行，后跟分层表格」 | `user` | 长期 |
+| `feedback` | 用户对 AI 的**纠正与确认** | 含**一次交互事件**：我（AI）做了 X → 用户要求 Y / 认可 Y | 「上次用 `forEach` 被要求改成 `map`」；「回答别铺太长，只要 bullet 式条目」 | `user`（绑定仓库时 `repo`） | 长期（晋升后 supersede） |
+| `project` | 项目目标、决策、截止日期 | 是**计划 / 承诺**，含方向或期限 | 「Q3 要迁移到 TypeScript」；「fiat-agent 从 Python+LangGraph 迁到 Pi（TS）」 | `repo` | 中期（`projectTtlDays`） |
+| `reference` | **外部系统指针** | 回答「**什么在哪儿**」：外部系统入口，或仓库内权威位置 | 「Bug tracker 在 Linear：xxx」；「工具策略权威是 `config/tool_policies.yaml`」 | `repo` / `global` | 中期（**最易过时**） |
+
+**`user` vs `feedback` 怎么切**（新口径下唯一需要切的一刀，比原 `user`↔`performance` 好切——原始描述里那两类的边界是真重叠，这两类是「结论 vs 证据」，天然可分）：
+
+| 判据 | `user` | `feedback` |
+|---|---|---|
+| 有没有**事件锚点** | 无（稳态陈述） | 有（「上次」「这次」「你刚才」） |
+| 宾语是不是**我（AI）的一次输出** | 不是 | 一定是 |
+| 例 | 「偏好函数式风格」 | 「上次用 `forEach` 被要求改成 `map`」 |
+
+> 同一件事可以**两条并存**：`feedback` 是证据（带会话溯源），`user` 是结论（可被热注入）。这不是重复，是 15.6 的幂等键与 supersede 机制要处理的正规形态。
+
+**`feedback` → `user` 的晋升**（⭐ 设计补充，**已拍板（tog，2026-09-23 本轮）** —— 撤销 `performance` 后必须有它，否则「跨项目通用口径」无处安放）：
+
+`performance` 撤销后，「循环用 `for` 不用迭代器」这类**浓缩偏好**若只靠 `feedback` 承载，热注入段会被十条「改 map」「别用 forEach」灌满——而它们**其实是同一件事**。所以定一条晋升链：
+
+| 阶段 | 形态 | 落点 |
+|---|---|---|
+| 单次纠正 / 确认 | `feedback`（带事件锚点 + `evidence`） | 工具检索可召回 |
+| 同向 ≥ `promotionThreshold`（缺省 3）次，且语义相近 | **代码判定**通过 → 新写一条 `user`（提炼式、去事件锚点），同族 `feedback` 全部标 `superseded` | 热注入主内容 |
+
+> 晋升是**确定性判定**：`policy.ts` 按 `sha256(scope + key + kind + 归一化 text)` 聚类 + 文本相似度阈值，**不让 LLM 再判一次**——与 15.2「LLM 只产候选，代码决定落盘」同一口径。旧 `feedback` 只标 `superseded` 不物理删，溯源链完整。
+
+> ⚠️ **`reference` 是最危险的一类**：外部系统会换（Linear → Jira）、仓库内位置会重构。它必须带 TTL + `stale` 标记，且**进回答前要能溯源到具体会话**——模型引用一条过时的 `reference` 比不引用更糟。
+
+#### 15.6 数据模型
+
+```ts
+// src/server/memory/types.ts（草案）
+export type MemoryKind = "user" | "feedback" | "project" | "reference";
+export type MemoryScope = "user" | "repo" | "global";   // 决定隔离边界，由 L2 注入
+export type MemoryStatus = "active" | "superseded" | "stale" | "forgotten";
+
+export interface MemoryEntry {
+  id: string;                 // 记忆条目 id（RAG 侧生成，全局唯一）
+  scope: MemoryScope;
+  key: string;                // scope 内的分区键：user → userId；repo → repo 名；global → "shared"
+  kind: MemoryKind;
+  text: string;               // 单条正文（**硬上限，缺省 300 字**）
+  evidence: {                 // 溯源：可撤销的前提
+    sessionId: string; userId: string; createdAt: string; trigger: "correction" | "session_end" | "manual";
+  };
+  confidence: number;         // 0~1，LLM 自评 + 代码下限校验（< minConfidence 直接丢弃）
+  supersedes: string[];       // 本条替代了哪些旧条目（旧条目标 superseded，**不物理删**）
+  promotedFrom?: string[];    // 仅 kind="user"：由哪些 feedback 晋升而来（晋升链，见 15.5）
+  status: MemoryStatus;
+  lastUsedAt?: string; usedCount: number;   // 检索侧异步回写（二期）
+}
+
+/** LLM 在 fork 里能产出的**全部**字段——注意没有 scope / key */
+export interface MemoryCandidate {
+  kind: MemoryKind;
+  text: string;
+  confidence: number;
+  reason: string;             // 为什么值得记（供审计摘要，不进记忆库）
+}
+```
+
+**三条结构性约束**：
+1. `scope` / `key` **不在** `MemoryCandidate` 里——LLM 产出中没有隔离字段，由 L2 按主会话 subject 注入（`session/factory.ts:50` 的 `SessionSubject`）。
+2. **append-only + supersede**：不物理删（除 `forget` 的合法调用），新条目标 `supersedes`，旧条目标 `superseded`。检索时过滤 `superseded`——这从机制上消灭「两条互相矛盾的 active 记忆」。
+3. **幂等键** = `sha256(scope + key + kind + 归一化 text)`。同一事实重复提取不产生新条目（与阶段 12 `applyProposal` 幂等键 `hash(target + 归一化正文)` 同口径）。
+
+#### 15.7 存储：不是"向量 **或** BM25"，是**双写**
+
+原始描述说「通过 RAG 转化为向量，**或者**通过 BM25 转换为倒排索引」——实际 RAG server 是 **hybrid**，两者**同时**写：
+
+| 侧 | 环节 | 现有落点（`MODULAR-RAG-MCP-SERVER`） |
+|---|---|---|
+| dense 向量 | 编码 + upsert | `src/ingestion/embedding/dense_encoder.py` → `src/ingestion/storage/vector_upserter.py` |
+| sparse 倒排 | BM25 建索引 | `src/ingestion/embedding/sparse_encoder.py` → `src/ingestion/storage/bm25_indexer.py` |
+| 召回融合 | dense + sparse → RRF | `src/core/query_engine/hybrid_search.py` + `fusion.py`（+ 可选 `reranker.py`） |
+
+**结论：不需要新写检索栈**，只要给 ingestion pipeline 加一条「memory 写入入口」，并在检索时把 collection 限定到 `fiat_memory_*`。
+
+RAG 侧需新增 **3 个 MCP 工具**（当前 3 个工具全是只读：`query_knowledge_hub` / `list_collections` / `get_document_summary`，见 `src/mcp_server/tools/`）：
+
+```python
+# memory_store —— 写（只由 L2 确定性代码调用，不注册给任何会话）
+{ "scope": "user|repo|global", "key": str, "kind": str, "text": str,
+  "evidence": {...}, "confidence": float, "supersedes": [id, ...] }
+→ { "stored": id, "superseded": [id, ...] }          # 双写向量 + BM25
+
+# memory_search —— 读（注册为 L1b 工具，模型自主调用）
+{ "query": str, "scope": str, "key": str, "kinds": [str]?, "top_k": int = 5 }
+→ [ { "id", "kind", "text", "score", "status" } ]     # 强制按 scope+key 过滤
+
+# memory_forget —— 撤销（CLI / 人触发，不注册给会话）
+{ "ids": [id, ...] } → { "forgotten": int }
+```
+
+> ⚠️ `memory_search` 的 `score` **必须标明语义**（RRF 融合分还是 rerank 分），否则模型会把「分数 0.82」当置信度解读。缺省不加 reranker，score = RRF 融合分。
+
+> 📌 **上面的入参形态是设计意图，不是最终 schema。** RAG 侧落地时的**实际 schema 与返回体**见 `MODULAR-RAG-MCP-SERVER/DEV_SPEC.md` 阶段 J：写工具 → **J4.1**；检索工具 → **J5.1 / J5.3**（返回体多了 `score_type` / `scope` / `key` / `degraded` 四个必需字段，理由见该处表格）；撤销工具 → **J6**。两侧形态的唯一事实源是本文档 §15.16 的**跨仓库契约表**。
+
+#### 15.8 触发：不要每轮都跑
+
+「每轮结束都让 LLM 判断」是原始描述里的原话，但**每轮一次 fork = 每轮一次额外 LLM 调用**，token 成本与延迟都不可接受（chat 场景一轮可能就几秒）。改成**确定性信号 + 兜底**：
+
+| 触发点 | 判据 | 位置 | 典型产出 kind | 成本 |
+|---|---|---|---|---|
+| **纠正信号**（主） | 用户文本命中纠正/偏好措辞（「不对」「应该是」「以后都」「记住」「不要再用」…），或本轮出现「工具失败 → 改参数后成功」 | 宿主 `onUserTurn` 之后，确定性正则 | **`feedback`**（几乎必然；提示词硬约束：纠正信号命中时优先出 `feedback`，不要直接跳到 `user`） | 零 LLM 预筛；命中才起 fork |
+| **累计轮次**（次） | 会话内用户轮次 ≥ `minTurns`（缺省 3）且本会话提取次数 < `maxRunsPerSession` | 宿主 | `user` / `project` / `reference` | 同上 |
+| **会话结束**（兜底） | `agent_end` / REPL 退出前跑最后一次 | 宿主 | 四类皆可（兜底清扫） | 每会话最多 1 次 |
+
+> **触发点与 kind 的对应关系是提示词的一部分，不是巧合**：纠正信号是 `feedback` 的**天然采集口**（15.5 的「事件锚点」正好在用户这句话里），所以命中纠正信号时若 LLM 产出别的 kind，`policy.ts` 应记录一次归类漂移告警（不拒，但可观测）。
+
+> **确定性预筛（`memory/policy.ts`，纯函数、零 LLM）在 fork 之前**：信号检测 → 候选长度上限 → 敏感扫描 → 「与权威三源重复检测」（知识库 / `AGENTS.md` / `config/*.yaml` 里已有的事实不记，与阶段 12 `MEMORY_GUIDE` 第 3 条同构）。**预筛不过 = 连 fork 都不起**，省掉无用 LLM 调用。
+
+#### 15.9 安全红线：记忆是**持久化**注入面
+
+这是本阶段与前 14 个阶段**性质不同**的风险：以往的风险面是「当轮」的（block 一次调用、拦一次写入），记忆的风险面是「**此后所有会话**」。四条对策：
+
+1. **写入口唯一**：只有 `memory/store.ts` 能写，且只接受过 schema 校验的 `MemoryEntry`。主会话工具表里**永不出现**写工具（硬约束 1）。
+2. **禁写形态用正则兜底**：与阶段 12 `policy.ts` 同思路（提示词是劝、正则才是拦）。禁止写入：
+   - **规则形态**：「以后一律…」「无需审批」「跳过校验」「免复核」→ 直接拒（记忆绝不能成为第二规则源）；
+   - **生产数据**：订单号 / 金额 / 手机号 / 卡号 / 邮箱 / 用户标识 → 命中即拒（不脱敏后入库，而是**整条丢弃**——脱敏后的记忆往往已失去价值，留着一个残缺事实更危险）；
+   - **指令性内容**：形如「你必须…」「忽略之前的…」的祈使句 → 拒（这就是 prompt injection 的形态本身）。
+3. **正文不进审计、不进 span**：审计只记 `id` / `hash(text)` / `length` / `kind` / `scope` / `evidence.sessionId`——审计表是合规证据，不是记忆副本；span 同理（`tracing.yaml` 的 `capture_content: redacted` 已定调）。
+4. **可撤销 + 可溯源**：每条记忆带 `evidence`（哪个会话、哪个用户、什么时候），`fiat memory forget <id>` 一键撤销。**没有溯源就不能撤销，不能撤销的记忆库不能上线。**
+
+#### 15.10 与阶段 12 记忆的边界（两套"记忆"不能打架）
+
+| | 阶段 12 记忆 | 阶段 15 长期记忆 |
+|---|---|---|
+| 存储 | 本地 md（`workspace/memory/YYYY-MM-DD.md`） | RAG（向量 + BM25 双索引） |
+| 范围 | 单机 workspace，**无检索** | 跨会话、按需检索 |
+| 读取 | 全量注入近 3 天（双截断 1200 字） | 热注入一段（会话级冻结）+ 工具检索 |
+| 写入 | evolution propose → 审批 / 自动落盘 | 轮末 extractor fork → **确定性落库** |
+| 分类 | 无 | user / feedback / project / reference |
+| 定位 | 提示层（当日事实） | 派生层（跨会话知识） |
+| 落盘形态 | 文件（人可读、可 diff、进 git） | RAG 条目（机器可检、可撤销） |
+
+**建议（待确认项 4）**：长期记忆上线后，`workspace/memory/` **降级为「当日工作台」**——只承载"本会话内新澄清、还没被提取走"的临时事实，跨会话一律走 RAG。理由是两套机制都往 systemPrompt 注入，重复注入既是 token 浪费，又会给出**互相矛盾的证据**（文件说 A、RAG 说 B，模型无从判断哪个新）。
+
+#### 15.11 采集点与落点（不改 Pi 核心）
+
+| 层 | 落点 | 产出 |
+|---|---|---|
+| 宿主 | `host/loop.ts` 的 `onUserTurn`（:254）/ `runTurnSafe` 收口 | 触发判定输入（用户文本 + 本轮 toolResults 摘要） |
+| L1a（新增） | `host/l1a/memory-signal.ts`：`turn_end` 收集本轮 toolResults（失败→成功序列），`agent_end` 上报 | 纠正信号的**循环内**证据 |
+| L2 新增 | `memory/{types,policy,prompts,extractor,store}.ts` | 预筛 / 提取编排 / 落库 |
+| L1b 新增 | `host/l1b/memory-tools.ts` | `fiat_memory_search`（**唯一注册给会话的记忆工具，且是只读**） |
+| 组合根 | `session/factory.ts`（工具注册 + 热注入段）+ `cli/chat.ts`（extractor 接线，挂在 `service.afterTurn()` 之后） | 装配 |
+| L2 | `audit/client.ts` 双写 · `tracing` span | 留痕 |
+| 跨仓库 | `MODULAR-RAG-MCP-SERVER/src/mcp_server/tools/{memory_store,memory_search,memory_forget}.py` | 存储与检索 |
+
+**span 语义**（沿用阶段 14 命名规范）：`fiat.memory.extract`（fork 根，kind=`"memory"`）/ `fiat.memory.write` / `fiat.memory.search`（挂 `fiat.tool` 之下，与 `fiat.mcp.call` 嵌套）。
+
+#### 15.12 配置（人写锚点，`enabled` 缺省 false）
+
+```yaml
+# config/memory.yaml（阶段 15 / P15-92）
+memory:
+  enabled: ${FIAT_MEMORY:-false}      # 缺省关；关时零网络、零定时器、零行为变化
+  # 连接复用 config/rag.mcp.yaml，memory 只是多调 3 个工具
+  trigger:
+    onCorrectionSignal: true          # 确定性正则命中即触发（零 LLM 预筛）
+    minTurns: 3                       # 或累计用户轮次达标
+    atSessionEnd: true                # 会话结束兜底跑一次
+    maxRunsPerSession: 2
+  extract:
+    timeoutMs: 45000                  # 45s（比评审 60s 短：提取比反思轻）
+    sliceTurns: 12                    # 与 evolution 同口径，复用 slice.ts
+  write:
+    minConfidence: 0.6                # 低于此值直接丢弃，不落库
+    maxTextChars: 300                 # 单条记忆长度硬上限
+    maxPerRun: 5                      # 单次提取最多落几条（防"一次写 50 条"）
+  promote:                            # feedback → user 晋升（确定性聚类，见 15.5）
+    promotionThreshold: 3             # 同向 feedback 累计 ≥ 3 条 → 提炼为一条 user
+    similarityFloor: 0.82             # 同族判定用的文本相似度下限
+  read:
+    hotInjectionMaxEntries: 8         # 热注入段条数上限（会话首轮算一次后冻结）
+    hotInjectionMaxChars: 400
+    defaultTopK: 5
+    hotKinds: [user, feedback]        # 只有这两类进热注入（其余走工具）
+  retention:                          # 二期：到期标 stale + 检索降权，不物理删
+    referenceTtlDays: 90
+    projectTtlDays: 180
+  # user / feedback 不过期；feedback 被晋升为 user 后标 superseded（不删，保留溯源链）
+```
+
+`config/tool_policies.yaml` 追加（**人写锚点，自进化/记忆都只读**）：
+
+```yaml
+  - tool: memory_search              # 检索跨会话记忆（注册名 fiat_memory_search）
+    risk_level: L1                   # 只读；scope/key 由 L2 注入，模型无法越界
+    allowed_roles: [oncall, ops, viewer]
+    allowed_environments: [dev, staging, prod]
+    allowed_scopes: [memory_read]
+```
+
+> ⚠️ **必须加这条**：`policy/engine.ts:83` 对未知工具**默认拒绝**——新工具漏配策略会静默全灭（阶段 13 已踩过同类坑）。
+
+#### 15.13 任务清单
+
+- [x] P15-91 **【跨仓库前置】RAG server 新增 3 个 MCP 工具**（✅ 已完成 2026-09-23，落在 `MODULAR-RAG-MCP-SERVER` 的**阶段 J**）：`memory_store` / `memory_search` / `memory_forget`（`src/mcp_server/tools/`，对齐既有 `query_knowledge_hub.py` 的 `TOOL_NAME` / `TOOL_DESCRIPTION` / `TOOL_INPUT_SCHEMA` 三件套形状）；写入复用 `src/ingestion/pipeline.py` 现有链路（dense + sparse **双写**），检索复用 `HybridSearch`；**collection 约定 `fiat_memory_<scope>_<key>`，不与知识库混用**。本地验收：手工 MCP callTool 写入一条 → `query_knowledge_hub`（限该 collection）能召回。**实测证据**（该仓 `DEV_SPEC.md` §15.1~15.5）：J-01~J-14 全部 `[x]`；per-file 通过数 `guard 114 / tools 64 / isolation 40 / vector_store_contract 50 / chroma_roundtrip 34 / config_loading 11 / e2e 12`；**与 HEAD 干净 worktree 逐例比对：只在当前树失败 = 空（零回归）**，且唯一一处「只在基线失败」是被本阶段改好的既有红用例；真实向量 E2E 全链路（写 → 检索 → 撤销）在 ollama `bge-m3` 上跑通，撤销后 `degraded=false` **且** `count=0`（证明「真的删了」而非「库挂了」）
+- [x] P15-92 **契约与配置**（✅ 已完成 2026-09-23）：`src/server/memory/types.ts`（`MemoryKind` / `MemoryScope` / `MemoryStatus` / `MemoryEntry` / `MemoryCandidate` + wire 类型 `MemoryHit` / `MemorySearchResult` / `MemoryStoreResult` / `MemoryForgetResult` + `KIND_DEFAULT_SCOPE` + `MEMORY_ENTRY_ID_PATTERN` + `DEFAULT_MEMORY_CONFIG` / `MEMORY_PROMPT_VERSION`）+ `src/server/memory/config.ts`（加载器：**关记忆宽容、开记忆字段非法即抛**，复用 tracing 的 `${VAR:-default}` 插值）+ `config/memory.yaml` + `config/tool_policies.yaml` 追加 `memory_search` 条目（L1，**刻意不给 `collection_scopes`** —— 否则 `engine.ts` 会往入参注入 `collection`，给「谁决定分区」留下第二个说法）。**`MemoryScope` 的权威定义移入 `types.ts`**（`identity.ts` 改为 import + re-export：两份枚举会漂移成「路径按一个拼、collection 按另一个拼」）。单测 `test/memory-config.test.ts`（23 条，含契约 3 的 id 定长与契约 8 的 `maxTextChars=300` 断言锁）
+- [x] P15-93 **纯函数策略**（✅ 已完成 2026-09-23）：`src/server/memory/policy.ts`（**零 Pi 依赖**）—— ① 纠正信号检测（确定性正则，与提示词措辞成对；分 `correction` / `confirmation` 两组）+ §15.8 的**触发判定 `shouldExtract()`**（优先级：开关 → trivial → 预算 → 纠正信号 → 会话结束 → 轮次）+ trivial 预筛（§2.3）② 候选校验（kind 合法 / 长度上限 / `minConfidence`）③ **禁写三形态**正则兜底（规则形态 / 生产数据 / 指令性内容）④ 幂等键计算 ⑤ supersede 判定 ⑥ **`feedback` → `user` 晋升判定** ⑦ **归类漂移检测**。单测 `test/memory-policy.test.ts`（70 条）。**三处实现期事实源决策**见 15.17
+- [x] P15-94 **提取 fork**（✅ 已完成 2026-09-23）：三个文件 —— `src/server/memory/prompts.ts`（`MEMORY_SUBMIT_TOOL = "fiat_memory_submit"` + `KIND_GUIDE` 四类各「判定线 / 正例 / 反例」+ `renderExtractPrompt()`；硬约束「纠正信号命中 → 优先 `feedback`」写在提示词里）+ `src/server/memory/submit.ts`（`createCandidateSink(max)` **纯内存、零 Pi**，`normalizeCandidate` 只校形状、不跑策略）+ `src/server/memory/extractor.ts`（`MemoryExtractor`，**逐条复用阶段 12 的 fork 纪律**：`runFork` 注入（对齐 `reviewer.ts`）/ 只挂 `submit` 一个工具（运行时白名单）/ 45s 超时 / 递归防护靠 `checkWriteQualification()` 首句短路 / **永不抛** / 全量留痕）。管线：`shouldExtract → slice → fork → normalize → validateCandidate → dedupe → pickSuperseded → pickPromotions → port.write`。**两处实现期决策**见 15.17-⑦。单测 `test/memory-extractor.test.ts`（31 条，faux 驱动、零真实 Pi 会话），钉住六种失败模式：纠正信号命中必产 `feedback`、禁写三形态**不进** `acceptedIds`、幂等重复计 `duplicates`、晋升时 `supersedes === promotedFrom`、超时**仍采用**已入 sink 的候选、fork 抛错不影响本轮回复
+- [x] P15-95 **存储桥**：`src/server/memory/store.ts` —— 复用 `host/l1b/mcp-rag.ts` 的 `McpClientLike` 接口与 transport 配置，**但写入通道持独立 client 实例**（⚠️ 此处更正初稿的「不新建 MCP 连接」：共用连接的隔离依赖「代码永不把写方法包装成 HostTool」这条纪律，独立实例的隔离是**结构性的**——会话侧手上根本没有那个 client 对象，见设计文档 §3-L3）；调 `memory_store` / `memory_search` / `memory_forget` —— **入参只给 `scope` + `key`，不给 `collection`**（拼接是 RAG 侧的职责，`MemoryIdentity.collection` 降级为审计/展示用；见 §15.16 跨仓库契约 1）；`entry_id` 由本侧按 §15.6 幂等键生成后传入，**必须定长 `m_<32hex>`**（RAG 侧按前缀删，变长会误删，契约 3）；`forget` **属主校验靠 RAG 侧的 collection 分区**（不需要本侧传 owner，契约 7）；写入前后走 `policy.ts` 校验与 `slice.ts:redact()` 脱敏；检索结果**一律走第 ③ 道后置校验**（`assertOwned`，比对返回体里的 `scope`/`key`，不匹配即丢弃 + 记 `isolation_violation`，不抛），并消费返回体的 `degraded` 标志驱动熔断（`P15-106`）。（✅ 已完成 2026-09-23）：`MemoryStoreBridge` + `MemoryReadChannel`（会话侧唯一入口；**类型上没有 `write` / `forget`** —— 隔离是结构性的）+ `assertOwned`（导出纯函数，第 ③ 道防线，三处刻意的严格）+ `status()`（P15-99 的状态快照）。`call()` **一律先解 payload 再看 `isError`**。两处实现期更正见 **15.17-⑧**。单测 `test/memory-store.test.ts`（48 条）
+- [x] P15-96 **检索工具（L1b）**：`src/server/host/l1b/memory-tools.ts` —— `fiat_memory_search`；**`scope` / `key` 由宿主闭包注入，不出现在工具 schema 里**（模型既看不到也改不了隔离边界）；返回带 `id` 便于引用与纠错（✅ 已完成 2026-09-23）：schema 只有 `query` / `kinds` / `top_k`（测试**逐字扫 schema 文本**，6 个禁词一个不许出现）；三种「什么都没有」分开说（命中 / 真空 / `degraded` —— 混在一起最典型的事故是「RAG 挂了，模型告诉用户『你之前没提过』」）；`details` 只带 `ids` / `count` / `kind`，**不带正文**（硬约束 6）；越界条数**不告诉模型**（断言输出与「零违规」时**逐字相同** —— 弱一点的 `not.toContain` 挡不住「另有 N 条被丢弃」这种泄漏），只留 error 级宿主日志。单测 `test/memory-tools.test.ts`（13 条）
+- [x] P15-97 **组合根接线 + 热注入**：`session/factory.ts`（注册 `fiat_memory_search` + **会话首轮算一次热注入段并冻结**，追加在 `evolutionPrompt` 之后）/ `cli/chat.ts`（extractor 挂在 `service.afterTurn()` 之后）；**缺省不注册（fail-safe，现有测试零改动）**；位置契约更新为 `[gate, audit, modelRouter, ...evalRecorder?, ...evolutionTrigger?, ...traceHook?, ...memorySignal?]`（✅ 已完成 2026-09-23）：新增 `memory/hot.ts`（`composeHotSegment` 永不抛 + 3s 超时 + 纯函数 `renderHotSegment`；段内**无 id** —— 一条 id 占 34 字符而整段预算 400）与 `host/l1a/memory-signal.ts`（`turn_end` 只记 `{tool, isError}`，**永不记正文**）。**冻结落在宿主**（`PiHostLoop.hotSegment`）而不是组合根：`buildSession` 是同步的而热注入要一次异步往返；且**失败也冻结**（`hotApplied` 先置位再 await）—— 否则 systemPrompt 会话中途变化、prefix cache 全废。`buildMemoryWiring()` **先判 `cfg.enabled` 再碰身份**（关记忆时哨兵守卫根本不会被走到，硬约束 7 的落地细节）。单测 `test/memory-e2e.test.ts`（12 条，走**真实** `buildSession` + 假 MCP）
+- [x] P15-98 **审计与追踪**：写入 / 遗忘双写 `fiat_audit_log`（**正文不入、只记 id/hash/长度/kind/scope/evidence.sessionId**）；span `fiat.memory.extract`（kind `"memory"`）/ `fiat.memory.write` / `fiat.memory.search`（✅ 已完成 2026-09-23）：`memory/audit.ts`（`memory_written` / `memory_write_failed` / `memory_forgotten` 三个 outcome + `memoryAuditPayload` —— id / `sha256(text)` 前 16 位 / 长度 / kind / scope / collection / `evidence.sessionId`）+ `AuditOutcome` 加三值 + `TraceKind` 加 `"memory"` 与 `sampleRate.memory = 1`。**`await` 在这里是数据完整性决定、不是风格**：审计是**证据** → 逐条 await（不 await 会留下「写了但没有审计记录」的窗口，而那条记录正是合规意义上的证据；漏记一条失败会让「为什么这条没写进去」变成查不到的事）；提取是**尽力而为的派生数据** → 刻意不 await（硬约束 8）。审计自身**永不抛**（回归用例：「审计 client 抛错不影响写入结果」）。`write()` 的**所有**终结分支都过同一个 `note()` 收口 → 保证「审计条数 = 计划条数」
+- [x] P15-99 **CLI 与维护**：`fiat memory list / search / forget / stats`（离线可跑、零 Pi 依赖，对齐 `fiat trace status` 的写法）；retention 衰减与 `stale` 标记（**可延后到二期**）（✅ 已完成 2026-09-23，**retention 按本条约定延后二期**）：`cli/memory.ts`（`createMemoryOps` —— **零 Pi 依赖**，由源码级断言锁住：`memory/**` + `cli/memory.ts` 全文件不许出现 Pi 命名空间）+ `cli/index.ts` 的 `cmdMemory`（`stats` / `list` / `search` / `forget`，另有 `--scope user|repo|global` / `--kind` / `--top` / `--mode` / `--active-only`）+ `commands.ts` 四个渲染函数 + `HELP` + `entry.ts` 接线（`cliSubject()` 的 `resolveIdentity()` **可能抛**，刻意让它抛在 thunk 里由能力层收进 `stats` 的报告字段）+ `main()` 退出前 `await deps.memory.close()`。`MemoryStoreBridge` 同步新增 `status()`（零网络快照）。**三处实现期决策**见 **15.17-⑨**。单测 `test/cli-memory.test.ts`（36 条）+ `test/memory-store.test.ts` §10（`status()` 3 条）
+- [x] P15-100 **测试与验收**：`test/memory-policy.test.ts`（纯函数分支全覆盖：信号 / 禁写三形态 / 幂等 / supersede / **`feedback`→`user` 晋升（达阈值晋升、未达不晋升、不同族不误聚）** / **归类漂移告警**）+ `memory-extractor.test.ts`（faux 驱动：信号触发 → 候选 → 落库载荷断言；**纠正信号命中必须产 `feedback`**；递归防护；超时兜底）+ `memory-tools.test.ts`（mock MCP client：`scope`/`key` 注入正确、越界不可达）+ **`memory-isolation.test.ts`（必测：user A 写的记忆，user B 检索不到）** + 端到端（新会话召回 + 回答带 id 引用）；同步 `workspace/AGENTS.md` 与本文（✅ 已完成 2026-09-23）：`memory-policy.test.ts`（70）· `memory-extractor.test.ts`（34）· `memory-tools.test.ts`（13 —— schema 禁词逐字扫描 + 三种空/满措辞 + `details` 不带正文）· **`memory-isolation.test.ts`（9）** —— 「A 写的 B 检索不到」按**三道防线各一条**写：① 真实分区语义（不喂脚本化返回体）② 两个身份跑同一套代码 ③ 打开假服务的 `leakPartition` 让它**真的返回别人的条目**，断言被丢弃 + `isolationViolations` 记下证据；另有「B 用 A 的 entry_id `forget` 只得 `not_found`」「A 的热注入有、B 的空」「返回体缺 `scope`/`key` 时 fail-closed」· `memory-e2e.test.ts`（12 —— 走**真实** `buildSession`：关记忆零装配且工具表仍非空 / 工具注册 / 身份来自 subject / 新会话召回 / 跨用户热注入为空 / 工具输出带 id 且**不含 collection** / 降级措辞 / 工具表里没有写与遗忘 / 只读通道**没有** `write`/`forget` 成员）· `cli-memory.test.ts`（36）· 共用装置 `test/memory-fake-mcp.ts`（**有状态**假 MCP，带真实 `fiat_memory_<scope>_<key>` 分区、`entry_id` 幂等、`supersedes` 标退役、降级与越界注入开关）。**`workspace/AGENTS.md` 已同步**：工具清单加 `fiat_memory_search`、新增「跨会话长期记忆（阶段 15）」章节、人写锚点加 `config/memory.yaml`、并顺手修正过期表述 `workspace/memory/` → `workspace/users/<分区>/memory/`（P15-103 已改为按身份分区）。**实测：`npm run check` 干净；`npm test` 53 文件 / 672 例全绿**（2026-09-23 19:41，零回归）
+- [x] P15-101 **可信身份解析（A 期，✅ 已完成 2026-09-23）**：`src/server/identity/resolver.ts`（新增）—— `resolveIdentity()`（优先级 `trustedId` > OS（显式开 `FIAT_IDENTITY_SOURCE=os`）> `FIAT_USER_ID` > `"cli"` 哨兵）+ `isMultiTenantMemory()` + `IdentityUnavailableError`；`FIAT_MEMORY_MULTI_TENANT=1` 时解析不出身份 → **抛**，由 `cli/index.ts` / `cli/entry.ts` 收口**拒绝会话**（不是 fallback 到 `"cli"`）。**遗留**：`source` 字段暂无消费点 → 哨兵语义未生效（见 15.15-10）。设计文档 §3-L0 / §5.1
+- [x] P15-102 **隔离边界载体（A 期，✅ 已完成）**：`src/server/memory/identity.ts`（新增）—— `MemoryIdentity` / `resolveMemoryIdentity()`（**唯一构造点**）/ `sanitizeMemoryKey()`（小写折叠 + 非法字符→`_` + 去首尾 `_` + 截断 32 + **原始值 sha256 前 8 位**；空值 / `.` / `..` 抛）/ `memoryCollection()` / `GLOBAL_MEMORY_KEY`。identity **不带 `sessionId`**（必须会话无关的稳定值）；输入类型是与 `SessionSubject` 结构兼容的 `{ user: { id } }`，不 import `session/`（切断依赖环）。设计文档 §4.2 / §3-L2
+- [x] P15-103 **记忆改 per-identity 分区（A 期，✅ 已完成）**：`memoryStore.ts` 的 `memoryDir`（getter）→ `memoryDirFor(identity)` = `workspace/users/<safeKey>/memory/`；`appendFact` / `appendFacts` / `recentFacts` 全部改为 identity 入参；文件头写 `scope` / `key` 便于人肉核对；**③ role 约定有意保持共享**（不是隔离失效，见设计文档 §7 / §6-T15）。**不做旧 flat 目录回退读取**（已核实本仓无 `workspace/memory/` 历史数据）；写侧接线在 `evolution/apply.ts`，用 **`proposal.proposer`** 构造 identity（不能用 apply 时的会话主体，否则落在审批人分区）
+- [x] P15-104 **【B 期前置·第一件事】哨兵语义修复**（✅ 已完成 2026-09-23）：多租户下把 `FIAT_USER_ID=cli` **视为未配置** + 存储边界拒收 `source="cli"`；配套单测「多租户 + `FIAT_USER_ID=cli` → 拒绝」。理由见 15.15-10 与设计文档 §2.4：默认值一旦被持久化就无法与真值区分（hermes `_DEFAULT_USER_ID` 的教训）。**落地**：`identity/resolver.ts` 新增 `IDENTITY_SENTINEL` / `isSentinelIdentity()` / `assertNotSentinelIdentity()`，**两条方案都上**（值层面 `resolveIdentity` 把 `cli` 当「没配」；边界层面 `resolveMemoryIdentity` 构造前过守卫）；`test/memory-identity.test.ts` 新增 9 条（该文件 33 条全绿）
+- [x] P15-105 **写资格：非主上下文不写记忆**（与 §15.8 触发并轨）（✅ 已完成 2026-09-23）：`memory/policy.ts` 显式短路 `isPrimary === false` —— extractor fork 内部 / cron / eval 批量 / `job-apply` 等程序化路径**不产生写入**（既防递归提取，也防系统提示词污染用户画像）。判据来自 hermes `agent_context`（`"subagent"` 在跳过集合里），见设计文档 §2.6。**落地**：`AgentContext` 六值（hermes 四值 + fiat 特有的 `eval` / `job-apply`）+ `NON_PRIMARY_CONTEXTS` 单一事实源 + `checkWriteQualification()`（先判上下文后判开关：cron 不写记忆的理由该是「它是 cron」而不是「记忆没开」）。**消费点**：`P15-94` 的 extractor 首句短路 + `P15-95` 写入通道要求显式传上下文
+- [x] P15-106 **熔断 + 有界 drain**（✅ 已完成 2026-09-23）：① 检索侧断路器 —— `memory/circuit.ts` 的 `MemoryCircuitBreaker`（连续 5 次失败 → 冷却 120s，对齐 hermes `_BREAKER_THRESHOLD` / `_BREAKER_COOLDOWN_SECS`；**时钟注入**，否则这组测试没人会跑）；`RagStatus` 加 `circuit_open` 取值以与 RAG 状态**合并展示**（设计文档 §2.7 原话）。② 有界 drain —— `memory/drain.ts` 的 `MemoryDrain`（`track()` 登记在飞写入；`run()` 超时即放弃 + 记 `abandonedTotal` + 日志，**永不抛 / 永不超时后继续等**）；单测 `test/memory-circuit.test.ts`（19 条，含「不假装成功」「写入失败也算结算」）。**消费点**：`P15-96` 检索工具套断路器；`P15-97` 把 drain 挂进 `ChatSession.flush()`（**复用阶段 14 已加的钩子，不新开**）
+
+#### 15.14 阶段 15 硬约束（实现时不得破）
+
+1. **主会话零写记忆能力**：写工具不注册、永不出现在主会话工具表里；写入只能由 L2 确定性代码发起。
+2. **记忆永不参与**权限 / 金额 / 状态机 / 字段校验（阶段 12 铁律 4 的直接延伸，也是 Claude Code 官方那句「context，不是强制配置」的落地）。
+3. **`scope` / `key` 由 L2 注入**，LLM 产出结构里**没有**这两个字段；隔离边界不经 LLM。
+4. **记忆与知识库不同 collection，检索结果不合并**；`fiat_memory_search` 只搜 `fiat_memory_*`。
+5. **禁写三形态**（规则形态 / 生产数据 / 指令性内容）由**正则兜底**实现，不依赖提示词自觉——提示词是劝，正则才是拦。
+6. **正文不进审计、不进 trace span**：只记 id / hash / 长度 / kind / scope / 来源会话。
+7. **缺省关**：`FIAT_MEMORY` 未设走 no-op，零网络、零行为变化、现有测试零改动（同 `evalSink` / `evolution` / `tracing` 惯例）。
+8. **永不阻塞回复**：提取 fork 异步 + 检索失败降级为空结果（模型看不到记忆也能正常回答，只是少了历史）。
+9. **单条长度硬上限 + 单次条数上限**：记忆不是文档库，塞长文档一律拒。
+10. **每条可溯源、可撤销**：`evidence` 必填，`fiat memory forget <id>` 必须真的能让它从检索里消失；且 **`forget` 必须校验属主** —— 只按 id 删，会让拿到别人 entry id 的人（id 会在回答里被引用）删掉别人的记忆。
+11. **`MemoryIdentity` 只有一个构造点**（`resolveMemoryIdentity`）：任何地方不得手工拼 `key`、路径或 collection 名。隔离边界多一个拼法，就多一个漏加身份的地方。
+12. **写入通道用独立 client 实例**，不与通用 RAG 桥共用连接：会话侧手上**没有**那个 client 对象（结构性隔离），而不是靠「代码永不把写方法包装成 HostTool」这条纪律。
+13. **多租户模式解析不出身份 → 拒绝会话**，不 fallback；`"cli"` 只表示「没配」，**不等于**一个叫 `cli` 的用户（默认值被持久化后无法与真值区分，见 15.15-10）。
+14. **非主上下文（fork 子会话 / cron / eval 批量）不写记忆**：子会话产出的是「关于子任务的」，不是「用户对助手的表述」；子会话身份**显式继承**父会话，不重新解析环境变量。
+15. **检索结果一律走后置校验**：与闭包身份不匹配即丢弃 + 记 `isolation_violation`，**不抛**（不阻塞回答）。
+16. **`repo` / `global` 与 role 约定是「有意共享」**，不是隔离失效：改动前先读设计文档 §3-L2 的 ⚠️ 框 —— 把共享「修」成 per-user，会产生「同一份约定被复制成 N 份、各自漂移」，比共享更糟。
+
+> 第 11 ~ 16 条来自专项设计文档 `docs/P15-101-user-scoped-memory-isolation.md`（§9 硬约束 + §6 威胁模型）。该文档的威胁模型 **T1 ~ T15** 是本章硬约束的推导依据。
+
+#### 15.15 待确认与已拍板
+
+| # | 问题 | 结论 / 倾向 | 状态 |
+|---|---|---|---|
+| 1 | 记忆写入走 **RAG server 新增 MCP 工具**，还是 L2 侧直连 ingestion pipeline？ | **前者**（你的口径即此，且复用 hybrid search）；代价是要改 `MODULAR-RAG-MCP-SERVER` | 已定 |
+| 2 | 热注入（决策 C 第二轨）**做不做**？ | **做**。不做也能满足要求，但 15.0 第 2 条硬伤（prefix cache）会一直留着 | 已定 |
+| 3 | ~~`performance` 保留还是改 `preference`？~~ | 四类定为 `user` / `feedback` / `project` / `reference`，`performance` 撤销并入 `feedback` | **已拍板（tog，2026-09-23）**，15.3 / 15.5 / 15.6 / 15.8 / 15.10 / 15.12 已同步 |
+| 4 | 长期记忆上线后，阶段 12 的 `workspace/memory/` 怎么办？ | **降级为「当日工作台」**，跨会话一律走 RAG；避免两套注入给出矛盾证据。**并已按 per-identity 目录改造**（`workspace/users/<safeKey>/memory/`，见 15.16） | 已定 + A 期已执行 |
+| 5 | 记忆写入是否要**人审**（像技能落盘那样）？ | **不审**（可撤销 + 不进判定链）；`prod` 可考虑"高置信自动、低置信丢弃" | 已定 |
+| 6 | 提取 fork 的模型选型（与主会话同模型，还是走便宜档）？ | 走 **lite 档**（`model_policies.yaml` 里新加 `memory_extract` 路由）——提取是简单判断，不必用 pro | 已定 |
+| 7 | ⭐ `feedback` → `user` **晋升机制**（15.5 的设计补充，非你的原话）用不用？ | **用**。不用的话热注入段会被十条同义 feedback 灌满（「改 map」「别用 forEach」其实是一件事）；代价是 `policy.ts` 多一段聚类 + 3 个测试用例 | **已拍板（tog，2026-09-23 本轮）** |
+| 8 | `reference` 按新口径是「外部系统指针」，那**仓库内权威位置**（`config/tool_policies.yaml`）还算 `reference` 吗？ | **都算**——两者都是「什么在哪儿」，只是内/外之分。你最初的描述里「在哪个系统」与「代码在什么地方」本来就并列在同一类 | **已拍板（tog，2026-09-23 本轮）** |
+| 9 | 隔离的「钥匙」（`userId` 从哪来、凭什么可信）在哪定义？ | 独立设计文档 `docs/P15-101-user-scoped-memory-isolation.md`；A 期已实现 | **已拍板 + 已实现**，见 15.16 |
+| 10 | 隔离标识串（如 `"cli"`）与真身份要不要显式区分？ | **要**。默认值被持久化后就无法与真值区分，会静默滑回混装（hermes `_DEFAULT_USER_ID` 的教训）。修法见文档 §2.4，两条方案都上 | **已拍板（tog，2026-09-23）**：两条都上。设计与实现位点已定，随 B 期首批开工（`P15-104`） |
+| 11 | 非主上下文（fork 子会话 / cron / eval 路径）**该不该写记忆**？ | **不该**。判据：子会话产出的是「关于子任务的」，不是「用户对助手的表述」（hermes `agent_context` 口径）。落 `policy.ts` 显式短路 | **已拍板（tog，2026-09-23）**：不该写。随 B 期首批开工（`P15-105`） |
+| 12 | 检索失败「降级为空结果」怎么实现才真降级？ | 必须**熔断**：连续 N 次不可用 → 冷却期内直接返回空。否则每次仍撞 30s 超时，会话卡死。另：异步写入要有**有界 drain**（退出前 flush，超时即放弃 + 记 abandoned 计数） | **已拍板（tog，2026-09-23）**：要做。随 B 期首批开工（`P15-106`） |
+
+#### 15.16 用户维度隔离：专项设计与 A 期实现（引用 `docs/`）
+
+**本章只放索引与硬约束，完整设计在独立文档里** —— 隔离是跨仓库（fiat + `MODULAR-RAG-MCP-SERVER`）、跨期（A/B/C 三期）、且涉及威胁模型的专项，塞进 §15 会让主 spec 失焦。
+
+📄 **`docs/P15-101-user-scoped-memory-isolation.md`**（v2，2026-09-23）—— 结论：**§15 已把「隔离的锁」设计完了，唯一缺的是「钥匙」：`userId` 从哪来、凭什么可信。** 照原样实现，`user` scope 会退化成「所有人都是 `cli`」，隔离在纸面上成立、运行时失效。
+
+**该文档与本章的分工**：
+
+| 内容 | 在哪 |
+|---|---|
+| 记忆的分类 / 触发 / 落库 / 检索契约 | 本章 §15.1 ~ §15.15 |
+| 身份的来源与可信强度（L0） | 文档 §3-L0 / §5.1 |
+| 三道隔离防线的分工与失效模式（L2）★ | 文档 §3-L2 / §5.3 |
+| 威胁模型 T1 ~ T15 | 文档 §6 |
+| A/B/C 三期切片与 A 期实现核对 | 文档 §8 / §12 |
+| 借鉴 hermes 的七条结构（含 4 条缺口） | 文档 §2 |
+
+**A 期已完成（2026-09-23）**：`P15-101` 可信身份解析（`src/server/identity/resolver.ts`）· `P15-102` 隔离边界载体（`src/server/memory/identity.ts`）· `P15-103` 阶段 12 记忆改 per-identity 目录（`memoryStore.ts` 的 `memoryDirFor()`）· 读侧接线（`factory.ts`）· 写侧接线（`apply.ts` 用 `proposal.proposer`）· 24 例单测（`test/memory-identity.test.ts`）—— **实测：该文件 24 passed；全量 `npm test` 44 文件 / 399 例全绿**（2026-09-23 17:36，零回归）。
+
+**A 期遗留（B 期第一批，设计已全部定稿，不再有悬置项）**：哨兵值未生效（`P15-104`）· 写资格（`P15-105`）· 熔断与 drain（`P15-106`）· 后置校验第 ③ 道防线（`P15-95`/`P15-96`，需等 RAG 返回体才有对象）· 热注入未冻结（属 C 期 `P15-97`）。
+
+> ✅ **B 期已全部完成（2026-09-23）**：上面五项悬置全部落地（`P15-104` 哨兵 / `P15-105` 写资格 / `P15-106` 熔断 + drain / 后置校验 / 热注入冻结），
+> 连同 `P15-91`（跨仓库 RAG 侧 = `MODULAR-RAG-MCP-SERVER` 阶段 J）、`P15-92` ~ `P15-100`。
+> 阶段 15 的 16 条任务**全部 `[x]`**（`P15-91` ~ `P15-106`）。实现期决策与更正见 **15.17 ⑧ ⑨**。
+> **唯一按约定延后到二期的**：retention 衰减与 `stale` 标记（`P15-99` 条目内已说明）。
+> 实测证据：`npm run check` 干净；`npm test` **53 文件 / 672 例全绿**（2026-09-23 19:41，零回归）。
+
+> 📌 **B 期开工顺序（tog，2026-09-23 定）**：
+>
+> `P15-104` 哨兵 → **`P15-91` 跨仓库 RAG 侧**（= `MODULAR-RAG-MCP-SERVER` 的 **阶段 J**，设计已落于该仓 `DEV_SPEC.md`）→ `P15-105` / `P15-106` → `P15-92` ~ `P15-100`。
+>
+> **哨兵必须先修**：它的缺口现在只表现为「本地目录混装」，铺开 RAG 后会升级成「collection 混装」，而事后修复要动**已写入的数据**。
+
+#### 跨仓库契约（fiat ↔ MODULAR-RAG-MCP-SERVER）
+
+本节是**唯一的接口事实源** —— 两侧实现都必须对齐这里的形态。RAG 侧对应设计：`MODULAR-RAG-MCP-SERVER/DEV_SPEC.md` 阶段 J（J3 ~ J8）。
+
+| # | 契约 | fiat 侧 | RAG 侧 | 不对齐的后果 |
+|---|---|---|---|---|
+| 1 | **collection 归属** | **不传 collection**，只传 `scope` + `key`（已 sanitize）；`MemoryIdentity.collection` 降级为**审计/展示用** | 自己拼 `fiat_memory_<scope>_<key>`，拼完**再校验一次**白名单正则 | 两边各有一份拼接逻辑 → 迟早不一致 → 写入与检索落到不同分区（**最难查的静默失败**） |
+| 2 | **`entry_id` 生成方** | fiat 侧生成（取 §15.6 的幂等键 `sha256(scope+key+kind+归一化 text)`） | 只校验形态 `^m_[0-9a-f]{32}$`，**不做归一化** | 跨语言做「归一化文本」必然不一致；且 RAG 侧算出的 id 无法被 fiat 侧的幂等逻辑复用 |
+| 3 | **`entry_id` 必须定长**（`m_` + 32 hex） | 生成时定长 | 定长不符即拒 | RAG 侧 `remove_document` 按**前缀**匹配删除（`bm25_indexer.py:394`）；变长会出现「`m_abc` 是 `m_abcd` 的前缀」→ **误删他人条目** |
+| 4 | **一条记忆 = 一个 record，不切分** | 单条 ≤ `maxTextChars`（300） | 超长**拒写**（不截断、不切分） | 切分会让 `entry_id` 与 `chunk_id` 分离，`forget` 变成两次查找 |
+| 5 | **检索返回体** | 消费 `hits[].{id, kind, text, score, **score_type**, status, **scope**, **key**, created_at}` + `collection` / `count` / **`degraded`** | 按此形态返回 | ① `scope`/`key` 缺失 → **后置校验（第 ③ 道防线）无从比对**；② `score_type` 缺失 → 模型把 RRF 融合分当置信度；③ `degraded` 缺失 → 无法区分「没有记忆」与「RAG 挂了」，熔断器（`P15-106`）无从触发 |
+| 6 | **`status` 语义与 supersede 谁执行** | 判定「哪条被替代」（`policy.ts` 聚类），把 `supersedes: [id]` 传下去 | 执行 `update_metadata(status="superseded")`，**只改 metadata 不动向量** | 若 RAG 侧用 upsert 顶替，必须重新提供向量 → 白跑一次 embedding |
+| 7 | **`forget` 属主校验靠分区** | 只把「自己的」`entry_id` 传下去 | 在指定 collection 内 `delete`，找不到即记 `not_found` | 若改成「传 owner 字段来比对」，多一个漏点（忘了比 / 比错字段 / 字段可被改）；**分区不可能「忘」** |
+| 8 | **`max_text_chars` 与 `maxTextChars` 必须一致** | `config/memory.yaml` | `config/settings.yaml` 的 `memory.write.max_text_chars` | 「fiat 认为合法、RAG 拒写」——最难查的那类静默失败。**两边各写一条断言测试锁住自己的值** |
+| 9 | **`memory_*` collection 不出现在列表里** | 不依赖它 | `list_collections` 的 `include_memory` **缺省 False** | 分区名里含 `userId`，列出来等于把「有哪些用户」暴露给模型 |
+
+
+> ⚠️ **进入 B 期的前置顺序**：**先修哨兵（`P15-104`），再动 `P15-91` 的跨仓库改动。** 哨兵缺口目前影响面是「本地目录混装」，铺开 RAG 后会升级成「RAG collection 混装」，且事后修复要动已写入的数据。（完整顺序见本节上方 📌）
+
+#### 15.17 实现期决策与更正（2026-09-23，阶段 15 B 期）
+
+> 本节的规矩与 RAG 侧 §J15 一致：**实现期发现的事实写回文档**，不让它与代码分叉。
+
+**① `feedback` 不走 supersede（否则晋升链自相矛盾）** —— 这是本轮最要紧的一处澄清。
+
+§15.5 的晋升链要求「同向 `feedback` 累计 ≥ `promotionThreshold`（3）条才提炼成一条 `user`」；
+而 §15.6 约束 2 要求「新条目标 `supersedes`，旧条目标 `superseded`」。两条规则**直接冲突**：
+若 `feedback` 也走 supersede，每写一条新的就把上一条标 `superseded`，**永远攒不到 3 条 active**，
+晋升链静默失效（而且失效方式很隐蔽 —— 热注入段只是「一直只有 feedback、没有 user」）。
+
+定案：`policy.ts` 的 `SUPERSEDING_KINDS = [user, project, reference]`，**不含 `feedback`**。
+两个机制的职责互补：
+
+| kind | 语义 | 机制 |
+|---|---|---|
+| `user` / `project` / `reference` | 同一件事的**最新说法** | 新替旧（supersede） |
+| `feedback` | **累积的证据** | 攒够阈值由晋升链统一收口成 `user`，届时才标 `superseded` |
+
+**② 晋升写入时 `supersedes` 与 `promotedFrom` **同时**填同一批 id（不是冗余）** ——
+
+分工不同：`supersedes` 是**给 RAG 侧的指令**（`memory_store` J4.2 第 5 步据此把这些 id 标
+`superseded`，契约 6「fiat 判定、RAG 执行」）；`promotedFrom` 是**给审计读的溯源链**
+（回答「这条 `user` 由哪几条 `feedback` 提炼而来」）。只填 `supersedes` 会丢溯源；
+只填 `promotedFrom` 则 RAG 侧不改状态，旧 `feedback` 继续留在检索结果里 —— 那正是晋升要解决的问题。
+
+**③ 禁写形态的正则与阶段 12 **共用**，并顺手补了阶段 12 的两个漏** ——
+
+§15.9 的「规则形态」禁令（「以后一律…」「无需审批」「跳过校验」「免复核」）与阶段 12 的
+`forbidden_approval_bypass` **本来就是同一批措辞**，因此 `memory/policy.ts` 直接 import
+`evolution/policy.ts` 的 `findForbidden` / `findSensitive` / `similarity` / `normalizeText`，
+**不新写一套正则**（两套必然一处紧一处松，那就是「一处判定说没有敏感信息、另一处却漏出去」的裂缝）。
+
+顺手发现并修掉的漏：共用表的审批旁路模式只枚举了「审批 / 审核 / 复核」，**不含「校验 / 验证」**，
+且动词侧缺「免」的简写形式 —— 于是 §15.9 自己举的「跳过校验」「免复核」两个例子**都没被拦住**。
+定案：扩展共用表的目标名词到 `审批|审核|复核|校验|验证|approval|approve|validation`，
+动词侧加 `(?<!避)免(?:除|去)?`（`(?<!避)` 用来挡掉「避免审批超时」这个正经句子）。
+**这是对阶段 12 的加强**（只多拦、不多放），阶段 12 的 30 条测试全绿。
+
+**④ 指令性内容是 `memory/policy.ts` 独有的第三形态** ——
+
+阶段 12 没有对应物，因为**技能正文本来就该是指令式的**（「先校验再提交」）。记忆不同：
+它会被注入此后每次 systemPrompt，存下一条祈使句等于给自己装了个后门。所以三组模式
+（对模型下命令 / 覆盖既有指令 / 伪 system 段）放在记忆侧，不与阶段 12 混。
+
+**⑤ `maxRunsPerSession` 的判定必须**先于**信号** ——
+
+信号是事件驱动的，用户连说十句「不对」就能把预算撑爆。预算排在信号之前，否则它形同虚设。
+同理，trivial 预筛排在预算之前（`ok` 这类输入连预筛都不必跑）。
+
+**⑥ 跨仓库契约 8 的断言落点** —— 两侧各写一条**锁自己值**的测试
+（fiat：`test/memory-config.test.ts` 断言 `maxTextChars === 300`；RAG：`config/settings.yaml` 侧同理）。
+**不互相读文件** —— 跨仓库读路径的测试不可移植（CI 里两个仓不一定同机）。
+
+**⑦ P15-94 提取 fork 的两处决策** ——
+
+**(a) 策略校验不放进 `submit` 工具的 schema，fork 返回后单独跑。**
+
+诱人的做法是把「长度上限 / kind 枚举 / 禁写三形态」全写进 `fiat_memory_submit` 的
+`inputSchema`，让 Pi 的参数校验替我们拦掉。**不能这么做**，两个理由：
+
+- 参数校验失败是**可重试的报错**。模型看到 `Input validation error` 会改写措辞再试一次 ——
+  「以后无需审批」被拒后改成「审批环节可以省掉」，**绕过的是我们唯一那道理性检测**。
+  禁写形态要的是**安静丢弃 + 留痕**（`rejected` 计数），不是和模型打一轮攻防。
+- schema 校验的粒度是「字段合规」，策略的粒度是「**这条该不该被记住**」。后者要读
+  `MEMORY_KINDS`、`minConfidence`、共享正则表，还得看 `enabled` ——塞进 typebox 会让
+  schema 与 `policy.ts` 成为同一套规则的两个副本，而它们必然一处紧一处松。
+
+定案：`submit.ts` 的 schema 只保证「四个 kind 之一 + text 是非空 string + 其余字段可选」，
+**`normalizeCandidate` 只做形状归一**（trim / 截断超长 / 补默认值，**永不抛**），
+`validateCandidate` 在 fork 返回之后跑，拒掉的候选**不进 `acceptedIds` 但仍然留痕**。
+`sink` 侧不知道「策略」这回事，`policy.ts` 侧不知道「Pi 工具」这回事。
+
+**(b) 超时语义 = 「不再等」，不是「中断」。**
+
+45s 到点时**已经在 sink 里的候选一律采用**，只是不再等剩下的。若把超时当失败，
+「候选质量」就会随网络抖动变成隐式的数据开关，而且边界附近的候选会**随机**蒸发 ——
+这种「时快时慢地丢数据」最难查。同时这也与阶段 12 的 fork 纪律一致：
+fork 的产出是**尽力而为的增量**，不是事务。
+
+配套：fork **永不抛**（`plan()` / `finish()` 各自 try/catch），提取失败绝不冒泡到本轮回复；
+`sink` 是纯内存对象，fork 抛错时已入 sink 的部分照常进入校验流程。
+
+**⑧ P15-95 存储桥的三处事实源更正** —— 这三条都是「按对端**代码**改，不按本仓初稿改」。
+
+**(a) `MemoryStoreResult.partialFailure` 的形态初稿猜错了。**
+
+初稿写的是 `{ failed: string[]; detail?: string }`；RAG 侧实际返回的是
+`dense_ok` / `sparse_ok` / `errors`（`MemoryStoreResult.to_dict()`）。
+**契约表没有规定这一条** —— 而它恰是「一个字段猜错就静默丢掉半写状态」的位置：
+按初稿实现会得到一个永远为 `undefined` 的 `partialFailure`，于是「向量写成功了、BM25 没写成功」
+被读成「写成功了」。定案：按对端代码改（`types.ts` 已更正并写明出处），并留一条测试钉住。
+
+**(b) `isError === true` **不等于**「没有 payload」。**
+
+这是本阶段最要紧的一处实现事实。RAG 侧的三条降级路径**全都**是「`isError=true` + 带 payload」：
+
+| 路径 | 形态 |
+|---|---|
+| `memory_search` 降级 | `failure(RuntimeError, payload={"degraded": true, "count": 0, ...})` |
+| `memory_store` 部分写 | 同一份 payload 里带 `dense_ok` / `sparse_ok` / `errors` |
+| 各类错误 | `error` / `error_type` 信封，同样带 payload |
+
+看到 `isError` 就抛，会**同时丢掉两个最重要的信号**：熔断器拿不到 `degraded`（于是 RAG 挂掉时
+每轮仍撞 30s 超时），半写状态变成「写失败」（于是重试的判据没了）。
+定案：`store.ts` 的 `call()` **一律先解 payload，再交给调用方判**；`isError` 只是
+「这条响应是失败的」这个事实的一部分，不是「payload 不存在」的同义词。
+
+**(c) RAG 侧没有 list 工具 → `listActive` 用「本轮候选文本」做探针。**
+
+`memory_search` 必须给 `query`，没有全量列举。所以 `listActive(identity, probe)` 拿候选文本
+做一次近邻召回，而不是枚举。这不是将就：supersede 与晋升的语义本来就只看**相似**的旧条目 ——
+一条无关的旧记忆既不会被顶替，也不该进同一个族。代价是「相似度阈值以下的旧条目看不见」，
+而那正是阈值要表达的意思。**同一事实也决定了 `P15-99` 的 `list` 必须给探针**（见 ⑨-b）。
+
+**⑨ P15-99 CLI 的三处决策** ——
+
+**(a) `stats` 必须**同步、零网络、永不抛**，身份解析失败是**报告内容**而不是命令失败。**
+
+诱人的做法是「在 entry 里当场 `resolveMemoryIdentity` 然后构造桥」，但
+`resolveMemoryIdentity` 在多租户下**会抛**（P15-104 的哨兵守卫）。那样 `fiat memory stats`
+——**恰好是排查「为什么没数据」的命令** —— 会在打印任何东西之前先自己挂掉，
+而「身份没解析出来」很可能就是它本来要报出来的答案。定案：
+
+- 身份构造收成 **thunk**（`(scope) => MemoryIdentity`），在能力层内 try/catch；
+- 失败 → `stats.identityError` 有值，其余字段（配置面 / 端点）照常输出；
+- **关记忆时连身份都不去解析**：关着就没有分区要报，而「关着但没配身份」报出来会误导。
+
+这与 `fiat trace status` 的纪律同源：一个「诊断不工作」的命令如果自己要先发网络请求，
+它自己就是不可靠的。所以 `status()` 也只读**已发生**的连接结果，不触发惰性连接。
+
+**(b) `list` 与 `search` 的缺省**刻意相反**：`list` **含**退役条目，`search` **不含**。**
+
+两个子命令的读者是同一批人，但问题不同：
+
+| 子命令 | 回答的问题 | `include_superseded` |
+|---|---|---|
+| `list <探针>` | 「这条记忆怎么**不见了**」 | **true** —— 看到它 `superseded` 就是答案本身 |
+| `search <查询>` | 「为什么是**这几条**排前面」 | **false** —— 与模型侧 `fiat_memory_search` 同口径 |
+
+第二行的「同口径」是刻意的：若 CLI 能查到退役条目而模型查不到，排查时第一个假象就是
+「CLI 查得到、模型查不到」。`--active-only` 用来把 `list` 拨到另一侧。
+
+**(c) 关记忆时 `forget` **抛**，不返回 `notFound`。**
+
+`MemoryStoreBridge.forget` 在 `enabled=false` 时早退返回 `{forgotten: 0, notFound: ids}`
+—— 那是因为它作为一个**降级组件**不该抛。但渲染出来是「**未在本分区找到这几条**」，
+而真相是「**根本不会去删**」。撤销是**不可逆动作**，语义错报的代价比一条报错高得多。
+定案：在 `cli/memory.ts` 层把「关着还调用 forget」升级成显式错误，`store.ts` 的早退语义不动。
+
+**`fiat memory` 的「零 Pi 依赖」由源码级断言锁住**（`test/cli-memory.test.ts` §6）：
+`src/server/memory/**` 与 `src/server/cli/memory.ts` 全文件不许出现 Pi 命名空间，
+且先断言「读到的文件数 > 10」—— 否则目录读空了也会「通过」。
+这条断言的价值在于：任何一次「顺手 import 个工具函数」都会立刻红，而不是等到
+某个没有 Pi dist 的环境里 `fiat memory` 起不来才发现。
+
+---
+
 ## 9. 约束与踩坑
 
 **铁律**：
@@ -740,6 +1295,9 @@ tracing:
 2. 不把权限判定只放在 `tool_call` block —— 它只是第一道。
 3. 高风险操作不返回 error，返回工单。
 4. LLM 不参与金额计算、状态机判断、字段校验。
+5. **记忆（技能 / 文件记忆 / 跨会话记忆）永远不是规则源**，也不参与权限 / 金额 / 状态机判定。权威只有三处：RAG 知识库、`config/*.yaml`、L2 规则引擎。三套记忆机制的定位见 §8 阶段 12（技能库 + `workspace/memory/`）与阶段 15（跨会话长期记忆）。
+6. **凡是「会被以后每次会话读回」的内容，写入口必须唯一且在校验之后**（阶段 15 的核心风险口径）：记忆是**持久化**注入面，一次污染影响此后所有会话，量级不同于「当轮生效」的 `tool_call` block。
+7. **决定「谁能看到」的字段只有一个构造点，且永不进 schema**（阶段 15 隔离设计文档口径）：`scope` / `key` / collection / `userId` 一类隔离标识，一律由代码从会话主体派生、以闭包注入，**不出现在任何对模型的 schema 里**，也**不允许任何地方手工拼接**。隔离标识多一个拼法，就多一处会漏加身份的地方。
 
 **版本纪律**（Pi 依赖）：
 
@@ -790,6 +1348,11 @@ tracing:
 | **「OpenClaw 不用 Pi extension」是误判** | 前稿据此写过「不用 extension 机制」，**此处更正**。实测 `pi-core` @ `27ae826`：它关掉的只是**目录自动发现**（`resource-loader.ts` 的 `noExtensions/noSkills/noPromptTemplates/noThemes/noContextFiles: true`），但仍经 `extensionFactories` 编译期注入 3 个内建 extension | 阶段 8 **保留 `extensionFactories` 通道**（P8-37/P8-40）。钩子型扩展不要改写为工具模块，否则要自造事件分发 + 短路回灌 + tool_result 改写 |
 | **扩展性质不可望文生义** | `alert-fanout` 名字像事件钩子，实测**零 `pi.on`、单个 `defineTool`**，是纯工具——「fanout」指 L2 `diagnosis/{plan,fanout}.ts` 的并发编排，L1 侧只注册 `fiat_alert_diagnosis` 并渲染报告 | 分流以**实测**为准：统计 `pi.on(...)` 事件数与 `defineTool` 定义数（见 §3 表），不以命名为准 |
 | **宿主级功能塞不进 Pi extension** | Pi extension 绑**单个 session** 生命周期，ctx 只有 `ui/mode/cwd/sessionManager(只读)/modelRegistry/signal`；无 HTTP 路由、无长驻服务、无渠道抽象；文档明写「run with your full system permissions」 | 长连接 / webhook / cron / 密钥 / 租户隔离 / 审批审计一律放宿主层（L2 `pi-host`）。这不是「嫌扩展麻烦」，是不能把**扩展的加载权**交给下层 |
+| **Claude Code 的记忆不是 RAG** | 官方 memory 文档：两套机制 = CLAUDE.md（人写、四层、启动加载）+ auto memory（机器写、per-repo、每次会话只加载**前 200 行 / 25KB**）。**两者都是文件 + 全量注入，没有向量检索**。（第三方逆向文章提到的 `.memdir` / `teamMemorySync` 非官方文档，实现时勿作依据） | 阶段 15 别照抄"文件全量注入"：那样只解决"跨会话"，不解决"按相关性召回"。**可借鉴的是它的分层与定位口径**（记忆是 context 不是强制配置；要拦动作必须用 hook），不是它的存储与读取方式 |
+| **记忆写入是持久化注入面** | 与 `tool_call` block（当轮生效）不同，记忆写入后的影响面是**此后所有会话**——一条被诱导写入的"以后无需审批"，等于长期掏空三道闸门 | 阶段 15 硬约束：主会话**零写工具**（写只能由 L2 确定性代码发起）+ 禁写三形态**正则兜底** + 正文不进审计/span + 每条带 `evidence` 可撤销 |
+| **隔离失效的默认表现是「一切正常」** | 隔离出错时**不抛异常、不打日志、检索照样返回结果，只是返回了别人的**。而且「所有人共用一个分区」在功能上完全可用（甚至更"聪明"，因为模型看到了更多上下文），所以它不会被任何功能测试发现 | ① 隔离**按层**单测（每层配一个"故意让它坏"的用例，A/B 双身份是最小装置）；② 三道防线纵深（物理分区 / 闭包注入 / 后置校验），不靠"记得写过滤条件"；③ 共享必须显式声明意图（`repo`/`global`/role 约定是**有意共享**，要有测试断言 + 文档 ⚠️ 框，否则后人会把它当 bug"修"掉） |
+| **默认值一旦被持久化，就无法与真值区分** | hermes `_DEFAULT_USER_ID = "hermes-user"` 的坑：setup 向导把建议默认值写进配置文件后，`configured` 就是非空 → 网关原生 id 被绕过 → 所有人共用 `hermes-user` 分区，全程无报错。fiat 的 `"cli"` 是同一形状的雷（`FIAT_USER_ID=cli` 写进 `.env` 就从"哨兵"变成"真身份"，多租户 fail-fast 再也拦不住） | 默认串必须被**显式识别为「没配」**：多租户下把 `"cli"` 视为未配置 + 存储边界拒收 `source="cli"`（P15-104）。**推论**：不要把身份值往配置文件里写（fiat 只用环境变量 + `trustedId` 注入，不学 hermes 的 `mem0.json`） |
+| **fork 子会话不是"小号的会话"** | ① 身份：子会话必须**显式继承**父会话 subject，不能重新解析环境变量（服务端形态下会拿到空身份）；② 写资格：子会话产出的是「关于子任务的」，不是「用户对助手的表述」——hermes 把 `"subagent"` 与 `cron` 一起放在**跳过写入**的集合里。fiat 的记忆提取本身就跑在 fork 里，若 fork 内又能触发提取就是**递归** | 阶段 15 需两条显式规则：身份继承（读侧已由组合根从 subject 派生）+ `policy.ts` 短路 `isPrimary === false`（P15-105）。**注意这两条是不同的问题**，别用一个"子会话特殊处理"混着做 |
 
 **Git 纪律**（多 pi session 并行时尤其重要）：
 

@@ -35,8 +35,11 @@ import { createEvolutionTrigger } from "../host/l1a/evolution-trigger.ts";
 import { createTraceHook } from "../host/l1a/trace-hook.ts";
 import { createProposeTools } from "../host/l1b/propose-tools.ts";
 import { createSkillTools } from "../host/l1b/skill-tools.ts";
+import { MemoryExtractor } from "../memory/extractor.ts";
+import { isTrivialInput } from "../memory/policy.ts";
+import { createMemorySubmitTool } from "../memory/submit.ts";
 import { loadModelPolicies, piApiName } from "../models/router.ts";
-import type { SessionSubject } from "../session/factory.ts";
+import type { MemoryFactoryOptions, SessionSubject } from "../session/factory.ts";
 import type { Tracer, TracingSource, TracingWiring } from "../tracing/types.ts";
 
 export interface ChatTurnResult {
@@ -51,7 +54,14 @@ export interface ChatSession {
 	sessionId: string;
 	/** 跑一轮；provider 失败不抛（runTurnSafe 兜底），返回结构化结果 */
 	turn(input: string): Promise<ChatTurnResult>;
-	dispose(): void;
+	/**
+	 * 释放会话。**异步**（阶段 15 起）：退出前要跑一次会话结束兜底提取 + 有界 drain
+	 * 在飞写入（最多 5s，超时即放弃）。调用方应 `await`——不 await 也能用，
+	 * 但那样 drain 就白加了（与 `flush()` 同一口径）。
+	 */
+	dispose(): Promise<void>;
+	/** 强制冲刷 tracer 队列；一次性脚本退出前必须调用，否则 unref 定时器可能在 flush 前被掐掉 */
+	flush(): Promise<void>;
 }
 
 export type ChatFactory = (subject: SessionSubject, sessionId: string) => Promise<ChatSession>;
@@ -105,6 +115,14 @@ export interface MakeChatOptions {
 	 * 某一轮之内，必须在调用那一刻取（见 tracing/types.ts 的 `TracingSource`）。
 	 */
 	tracing?: Tracer;
+	/**
+	 * 阶段 15（P15-97）：跨会话长期记忆。**缺省 undefined = 由 `config/memory.yaml` 与
+	 * `FIAT_MEMORY` 决定**（未开则整条链不装配）。
+	 *
+	 * 测试缝：传 `{ config: {...DEFAULT_MEMORY_CONFIG, enabled: true} }` 可强制开启，
+	 * 配合 `clientFactory` 注入 mock MCP。
+	 */
+	memory?: MemoryFactoryOptions;
 }
 
 /**
@@ -228,6 +246,7 @@ export function makeChat(opts: MakeChatOptions = {}): ChatFactory | undefined {
 			sessionId,
 			modelResolver: registryResolver(registry),
 			...(tracingSource ? { tracing: tracingSource } : {}),
+			...(opts.memory ? { memory: opts.memory } : {}),
 			...(evo && trigger
 				? {
 						evolution: {
@@ -268,6 +287,9 @@ export function makeChat(opts: MakeChatOptions = {}): ChatFactory | undefined {
 			// 阶段 12（P12-65）：技能索引 / 近期事实**追加在末尾**（按 name 稳定排序）。
 			// 空串 → undefined，保持「没开自进化」时的提示词字节级不变。
 			systemPrompt: built.evolutionPrompt || undefined,
+			// 阶段 15（P15-97）：热注入段**首轮算一次后冻结**（追加在 evolutionPrompt 之后）。
+			// 缺省不传 = 不注入 —— 关记忆时与阶段 14 的行为字节级一致。
+			...(built.memory ? { hotSegment: built.memory.hotSegment } : {}),
 			onUserTurn: () => service?.noteUserTurn(),
 			getApiKey: resolveKey,
 			// 阶段 14：一轮一条 trace —— 宿主在 runTurn 开头调它现开根 span（`fiat.turn`）
@@ -311,9 +333,92 @@ export function makeChat(opts: MakeChatOptions = {}): ChatFactory | undefined {
 			});
 		}
 
+		// ── 阶段 15（P15-97）：跨会话记忆的轮末提取 ──────────────────────────────
+		//
+		// 三个刻意的处置：
+		//
+		//   ① **不 await**（硬约束 8「永不阻塞回复」）。与评审 fork 的取舍相反 ——
+		//      那里 await 是因为「丢提案 = 整个自进化白跑」；记忆是**尽力而为的派生数据**，
+		//      丢一轮的代价只是少一条记忆。而阻塞的代价是每轮多等最多 45s。
+		//      兜底由 `drain` 提供：退出前有界等待（P15-106），所以「不 await」不等于「会丢」。
+		//   ② **fork 里没有任何记忆能力**（递归防护）：fork 的工具表只有 `fiat_memory_submit`，
+		//      且不注册 memorySignal / 不传 hotSegment。
+		//   ③ 触发来源**每轮现算**（`shouldExtract`），所以 `afterTurn` 的输入里带着
+		//      本轮用户原文与 L1a 收集到的工具步。
+		const memory = built.memory;
+		let forkSeq = 0;
+		/** 最后一个**非琐碎**的用户输入（会话结束兜底提取用它；「ok」这类输入不该触发清扫） */
+		let lastUserText = "";
+		const extractor = memory
+			? new MemoryExtractor({
+					config: memory.config,
+					identity: memory.identity,
+					sessionId,
+					transcript: () => host.agent.state.messages,
+					port: memory.store,
+					runFork: async (input) => {
+						// #2 HostSession.inMemory —— 绝不触碰主会话 transcript / JSONL
+						forkSeq += 1;
+						const forkSession = HostSession.inMemory(cwd, { id: `mem-${sessionId}-${forkSeq}` });
+						// #4 运行时白名单：**只有 submit 工具**。写库不在这里发生（那条路在 store.ts），
+						//    所以即使模型在 fork 里猜别的工具名，也只会拿到 "Tool ... not found"。
+						const forkTools = [createMemorySubmitTool(input.sink)];
+						// 阶段 14：提取 fork **独立成一条 trace**（kind = "memory"），
+						// 归属靠 metadata.parentSessionId 保留 —— 与评审 fork 同一处置。
+						const forkTracer = tracer;
+						const forkTracing: TracingWiring | undefined = forkTracer?.enabled
+							? {
+									tracer: forkTracer,
+									trace: forkTracer.startTrace({
+										name: "fiat.memory.extract",
+										kind: "memory",
+										sessionId: forkSession.id,
+										userId: subject.user.id,
+										role: subject.user.role,
+										environment: subject.environment,
+										metadata: { parentSessionId: sessionId, trigger: input.context.trigger },
+									}),
+								}
+							: undefined;
+						const forkRunner = forkTracing
+							? (
+									await setupEmbeddedExtensions({
+										cwd,
+										agentDir,
+										factories: [createTraceHook({ source: forkTracing })],
+									})
+								).runner
+							: undefined;
+						// #1 继承 runtime：同一个 model + 同一个 resolveKey → 命中同一条 prefix cache
+						// #5 递归防护：不传 hotSegment、不注册 memorySignal、不挂 extractor
+						const forkHost = new PiHostLoop({
+							model,
+							sessionId: forkSession.id,
+							systemPrompt: input.systemPrompt,
+							tools: forkTools,
+							session: forkSession,
+							getApiKey: resolveKey,
+							...(forkTracing ? { tracing: forkTracing } : {}),
+							...(forkRunner ? bridgeAgentHooks(forkRunner, { cwd }) : {}),
+						});
+						const unsubFork = forkRunner ? bridgeLifecycleEvents(forkHost.agent, forkRunner) : undefined;
+						try {
+							await forkHost.runTurnSafe(input.prompt); // runTurnSafe：provider 失败不抛
+						} finally {
+							unsubFork?.();
+						}
+						return lastAssistantText(forkHost.messages);
+					},
+				})
+			: undefined;
+
 		return {
 			sessionId: session.id,
 			async turn(input: string) {
+				// 会话结束兜底提取的输入：记最后一个**非琐碎**输入（「ok」这类不该触发清扫）
+				if (!isTrivialInput(input)) lastUserText = input;
+				extractor?.noteUserTurn();
+
 				// provider 失败不抛：runTurnSafe 双查（catch + stopReason:"error"）
 				const r = await host.runTurnSafe(input);
 				// 阶段 12（P12-64/66）：**轮末**汇合判定 + 评审 fork（§10.4）。
@@ -326,12 +431,39 @@ export function makeChat(opts: MakeChatOptions = {}): ChatFactory | undefined {
 					const outcome = await service.afterTurn();
 					if (outcome) evo?.onEvolution?.(outcome);
 				}
+				// 阶段 15（P15-97）：记忆提取**不 await**（硬约束 8）。
+				// L1a 收集的本轮工具步必须在 `runTurnSafe` 返回后取 —— 此刻所有 `turn_end` 都已触发。
+				if (extractor && memory) {
+					const steps = memory.signal.takeSteps();
+					memory.drain.track(
+						extractor.afterTurn({ userText: input, ...(steps.length > 0 ? { toolSteps: steps } : {}) }),
+					);
+				}
 				return r.ok ? { ok: true, reply: r.reply } : { ok: false, reply: r.reply, error: r.error };
 			},
-			dispose() {
+			async dispose() {
 				// HostSession 由 SessionManager 持有，transcript 已逐轮落盘；宿主仅持引用。
 				// 生命周期订阅要松开，否则 afterEach/长驻进程里会留着悬挂的 agent 订阅。
 				unsubLifecycle?.();
+
+				// 阶段 15：**会话结束兜底**（§15.8 第三行）—— 退出前跑最后一次提取。
+				// 输入用「最后一个非琐碎用户输入」：`userText` 只是触发判定的材料，
+				// 真正的回放内容来自 transcript 切片，所以用哪一轮的原文不影响提取质量。
+				if (extractor && memory && lastUserText) {
+					memory.drain.track(extractor.afterTurn({ userText: lastUserText, atSessionEnd: true }));
+				}
+				if (memory) {
+					// 关提交口（对齐 hermes `shutdown(wait=False, cancel_futures=False)`）：
+					// 已在飞的照跑，**之后**登记的写入不再算进这次 flush（否则永远追不上）
+					memory.drain.close();
+					await memory.drain.run(); // 有界（缺省 5s）：超时即放弃 + 记账，永不抛
+					await memory.close(); // 关两个 MCP client（读 / 写各一个）
+				}
+			},
+			async flush() {
+				// 一次性脚本/长驻进程在退出或关键节点前应主动 flush，否则 unref 定时器可能来不及发批。
+				// 阶段 15：记忆写入复用同一个钩子（**不新开**）—— 两件事都是「退出前把在飞的收口」。
+				await Promise.all([tracer?.flush() ?? Promise.resolve(), memory ? memory.drain.run() : Promise.resolve()]);
 			},
 		};
 	};

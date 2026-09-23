@@ -1,0 +1,84 @@
+# 跨会话长期记忆配置（阶段 15 / P15-92）
+#
+# 设计依据：Obsidian `法币 agent/法币定制 Agent DEV_SPEC（Pi 版）.md` §15.12；
+# 用户维度隔离专项设计见 docs/P15-101-user-scoped-memory-isolation.md。
+#
+# 本文件是**人写的锚点**（与 tool_policies.yaml / evolution.yaml 同级）——
+# 自进化循环与记忆提取都只读它，**永不写它**（阶段 12 硬约束 3 的延伸）。
+#
+# 缺省值本文件未给时取 src/server/memory/types.ts 的 DEFAULT_MEMORY_CONFIG。
+# `${VAR:-default}` 在加载时由 loadMemoryConfig() 插值（复用 tracing 的 interpolate）。
+#
+# 失败策略（与 evolution / tracing 都不同，是刻意的第四种）：
+#   - **关记忆时宽容到底**：文件缺失 / 字段非法一律回落默认，不抛（现有测试零改动）
+#   - **开记忆时字段非法即抛**：记忆的错误面是「此后所有会话都在注入的一条假事实」，
+#     「开了却不工作 / 配错了」的排查成本高于起不来（同 tracing 的口径）
+
+memory:
+  # 总开关。缺省关：零网络、零定时器、零行为变化（对齐 evalSink / evolution / tracing 惯例）
+  enabled: ${FIAT_MEMORY:-false}
+
+  # ── 连接 ───────────────────────────────────────────────────────
+  # 不在这里配连接：记忆只是多调 3 个工具，复用 config/rag.mcp.yaml 的同一个 transport。
+  # ⚠️ 但**写入通道持独立 client 实例**（§15.14 硬约束 12）—— 会话侧手上没有那个对象，
+  #    隔离是结构性的，不是靠「代码永不把写方法包装成 HostTool」这条纪律。
+
+  # ── 触发（§15.8：不要每轮都跑）─────────────────────────────────
+  trigger:
+    # 确定性正则命中即触发（零 LLM 预筛；命中才起 fork）
+    on_correction_signal: true
+    # 或累计用户轮次达标（次优路径：会话里的稳态偏好往往没有纠正信号）
+    min_turns: 3
+    # 会话结束兜底跑一次（agent_end / REPL 退出前）
+    at_session_end: true
+    # 单会话最多起几次提取 fork（注意：与「一次落几条」是两回事，见 write.max_per_run）
+    max_runs_per_session: 2
+
+  # ── 提取 fork（§15.11 / §15.7 第 6 条）────────────────────────
+  extract:
+    # 45s（比评审的 60s 短：提取比反思轻）。超时只记日志，永不阻塞用户回复
+    timeout_ms: 45000
+    # 脱敏切片回放轮数，与 evolution 同口径（复用 evolution/slice.ts 的 redact）
+    slice_turns: 12
+
+  # ── 写入校验（§15.9 硬约束 9）─────────────────────────────────
+  write:
+    # LLM 自评置信度低于此值直接丢弃，不落库
+    min_confidence: 0.6
+    # 单条正文长度硬上限。记忆不是文档库，塞长文档一律拒（超限**拒绝不截断**——
+    # 截断会静默改语义）
+    # ⚠️ 必须与 MODULAR-RAG-MCP-SERVER 的 config/settings.yaml → memory.write.max_text_chars
+    #    保持一致（跨仓库契约 8）。不一致 = 「fiat 认为合法、RAG 拒写」——最难查的静默失败。
+    #    两侧各有一条断言测试锁住自己的值（fiat: test/memory-config.test.ts）。
+    max_text_chars: 300
+    # 单次提取最多落几条（防「一次写 50 条」把记忆库灌满）
+    max_per_run: 5
+
+  # ── feedback → user 晋升（§15.5 晋升链）───────────────────────
+  # ⚠️ 晋升是**确定性判定**（sha256 聚类 + 相似度阈值），不让 LLM 再判一次 ——
+  #    与 §15.2「LLM 只产候选，代码决定落盘」同一口径。
+  #    撤销 performance 后必须有它，否则「跨项目通用口径」无处安放：
+  #    热注入段会被十条「改 map」灌满，而它们其实是同一件事。
+  promote:
+    # 同向 feedback 累计 ≥ 3 条 → 提炼为一条 user，同族 feedback 全标 superseded
+    promotion_threshold: 3
+    # 同族判定用的文本相似度下限（与 evolution 的 duplicate_threshold 同量级）
+    similarity_floor: 0.82
+
+  # ── 读取（§15.3 检索侧双轨）───────────────────────────────────
+  read:
+    # 热注入段：会话首轮算一次后**冻结**（同一会话内不再变，保护 prefix cache）
+    hot_injection_max_entries: 8
+    hot_injection_max_chars: 400
+    # 工具检索缺省条数（对应 memory_search 的 top_k）
+    default_top_k: 5
+    # 只有这两类进热注入；project / reference 走工具检索
+    # （后两类时效性差、最容易过时，塞进 systemPrompt 比不注入更危险）
+    hot_kinds: [user, feedback]
+
+  # ── retention（二期：到期标 stale + 检索降权，**不物理删**）──────
+  # user / feedback 不过期；feedback 被晋升为 user 后标 superseded（保留溯源链）
+  retention:
+    # reference 最易过时：外部系统会换（Linear → Jira）、仓库内位置会重构
+    reference_ttl_days: 90
+    project_ttl_days: 180

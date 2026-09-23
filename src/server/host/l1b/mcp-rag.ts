@@ -29,7 +29,18 @@ import { createTransport, type RagMcpConfig } from "./mcp-rag-transport.ts";
 
 export type { RagMcpConfig } from "./mcp-rag-transport.ts";
 export { ragConfigFromEnv } from "./mcp-rag-transport.ts";
-export type RagStatus = "ready" | "unavailable";
+/**
+ * RAG 侧（知识库 + 记忆检索）对外暴露的**统一状态词汇**。
+ *
+ * - `ready` / `unavailable`：**装配期**状态，由本模块的 bootstrap 报出（connect / listTools 结果）。
+ * - `circuit_open`：**运行期**状态，由记忆检索侧的断路器（P15-106，`memory/circuit.ts`）报出。
+ *
+ * 为什么两种状态共用一个类型：设计文档 §2.7 要求熔断状态与 `RagStatus`
+ * **合并展示** —— 用户视角的问题永远是「记忆/知识库现在能不能用」，
+ * 把它拆成两套词汇只会让上层又要做一次归并。加值不改语义，既有消费点
+ * 只比较 `"ready"` / `"unavailable"`，因此是纯增量。
+ */
+export type RagStatus = "ready" | "unavailable" | "circuit_open";
 
 /** 最小 client 接口：真实 SDK 与测试 mock 都满足 */
 export interface McpClientLike {

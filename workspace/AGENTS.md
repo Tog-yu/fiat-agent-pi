@@ -35,8 +35,8 @@
 
 Agent 的能力由「内建扩展 + 工具模块」提供，随 pi-host 内嵌循环装配（入口 `fiat chat`；旧的 `pi -e` 扩展加载器已弃用）：
 
-- **内建 extension（钩子型，编译期注入）**：`permission-gate`（工具调用拦截 / 闸门②）、`audit-hook`（审计落点）、`model-router`（按任务选模型）、`eval-recorder`（评测采集，可选）、`evolution-trigger`（自进化计数与触发，可选）、`trace-hook`（全链路追踪采集，可选）。
-- **工具模块（直接注册进内嵌循环）**：`mcp_rag.*`（RAG 检索）、`fiat_cashback_*`（返现对账）、`fiat_db_query_*`（只读查询）、`fiat_test_*`（测试自动化）、`fiat_lark_*`（Lark 通知 / 审批）、`fiat_job_apply`（持审批 token 执行生产写）、`fiat_alert_diagnosis`（并行告警诊断）、`fiat_skill_view`（读技能正文）。
+- **内建 extension（钩子型，编译期注入）**：`permission-gate`（工具调用拦截 / 闸门②）、`audit-hook`（审计落点）、`model-router`（按任务选模型）、`eval-recorder`（评测采集，可选）、`evolution-trigger`（自进化计数与触发，可选）、`trace-hook`（全链路追踪采集，可选）、`memory-signal`（循环内工具步收集，仅记忆开启时，可选）。
+- **工具模块（直接注册进内嵌循环）**：`mcp_rag.*`（RAG 检索）、`fiat_cashback_*`（返现对账）、`fiat_db_query_*`（只读查询）、`fiat_test_*`（测试自动化）、`fiat_lark_*`（Lark 通知 / 审批）、`fiat_job_apply`（持审批 token 执行生产写）、`fiat_alert_diagnosis`（并行告警诊断）、`fiat_skill_view`（读技能正文）、`fiat_memory_search`（检索跨会话记忆，**仅记忆开启时**）。
 - **仅评审 fork 内可用（不在主会话注册）**：`fiat_skill_propose` / `fiat_memory_propose` / `fiat_role_facts_propose`——只写提案表，**无任何文件系统写能力**。
 
 三道权限闸门：① 会话级工具裁剪（模型看不到无权工具）→ ② `tool_call` block 拦截 → ③ 服务端 `canExecute`（唯一权威）。
@@ -84,7 +84,21 @@ Agent 的能力由「内建扩展 + 工具模块」提供，随 pi-host 内嵌�
   `max_retries` 次、只记计数、**绝不抛**——观测系统挂掉不能把业务挂掉。
 - **自检**：`fiat trace status`（离线可跑、零网络）打印开关 / 端点 / 队列与丢弃计数。「没数据」时先跑它。
 
-**人写锚点，自进化只读**：本文件（`AGENTS.md`）、`config/tool_policies.yaml`、`config/eval_cases.yaml`、`config/evolution.yaml`、`config/gateway.yaml`、`config/tracing.yaml`。模型只能改技能库与 `workspace/memory/`。
+## 跨会话长期记忆（阶段 15，默认关闭：`FIAT_MEMORY=true`）
+
+参考 Claude Code 的「记忆」但**只学一半**：学「跨会话沉淀用户偏好与纠正」，**不学**「模型自主决定记住什么」。
+口径是**「写入侧不给主会话任何写工具」**——
+
+- **四类记忆**：`user`（关于人的长期事实）/ `feedback`（用户的纠正与已确认的偏好）/ `project`（项目目标、决策、约束）/ `reference`（外部系统或权威位置指针）。分类按「这条记忆是关于谁的、被什么触发的」切，不按主题切。
+- **写入只由 L2 确定性代码发起**：轮末（纠正信号命中 / 累计 `min_turns` 轮 / 会话结束）起一个**隔离 fork** 提取，模型只产出「候选」（`kind` + `text` + `confidence`），**产不出 `id` / `scope` / `key`**；候选要过长度上限（缺省 300 字）、`min_confidence`（缺省 0.6）、**禁写三形态正则**（规则形态 / 生产数据 / 指令性内容）才落库。写入通道持**独立 MCP client**，且它**永不进工具表**。
+- **检索双轨**：会话首轮算一次**热注入段**（只有 `user` / `feedback`，≤8 条 / ≤400 字，追加在 systemPrompt 末尾）后**冻结**（中途变化会打掉 prefix cache）；其余走工具 `fiat_memory_search`（**带 id 返回**，便于引用与纠错）。
+- **与用户的记忆物理隔离**：分区 `fiat_memory_<scope>_<安全化 user_id>`，与知识库 collection 不混用；`scope` / `key` 由宿主闭包注入、**不出现在任何工具 schema 里**，模型既看不到也改不了隔离边界。返回体里的 `scope`/`key` 与本会话身份不符 → 丢弃 + 记 `isolation_violation`（**不抛**）。
+- **记忆不是规则**：热注入段与工具输出都**永不参与**权限 / 金额 / 状态机判定（§15 硬约束 2）。被检索内容一律当**待核实的历史上下文**，与用户当前说法冲突时以当前为准。
+- **降级要说清楚**：记忆不可用（RAG 挂 / 熔断 / 关着）时检索结果会明确标「暂不可用」——**不要据此断定用户没说过**。检索侧有熔断器（连续 5 次失败 → 冷却 120s），否则每轮都要撞 30s 超时。
+- **撤销**：`fiat memory forget <entry_id...>`（人触发，属主校验靠分区天然提供）。没有溯源就不能撤销，而不能撤销的记忆库不能上线。
+- **维护**：`fiat memory stats / list / search / forget`（零 Pi 依赖；`stats` 零网络）。
+
+**人写锚点，自进化只读**：本文件（`AGENTS.md`）、`config/tool_policies.yaml`、`config/eval_cases.yaml`、`config/evolution.yaml`、`config/gateway.yaml`、`config/tracing.yaml`、`config/memory.yaml`。模型只能改技能库与 `workspace/users/<分区>/memory/`（阶段 12 的近期事实；**按身份分区**，不再是一个共享的 `workspace/memory/`）。
 
 ## 工具命名约定
 
@@ -94,6 +108,7 @@ Agent 的能力由「内建扩展 + 工具模块」提供，随 pi-host 内嵌�
 - `fiat_lark_*`：Lark 通知 / 审批卡片
 - `fiat_job_apply`：持审批 token 执行生产写
 - `fiat_skill_view`：读技能库正文（只读）
+- `fiat_memory_search`：检索**跨会话长期记忆**（只读；分区由宿主按身份限定，模型无从指定）
 - `fiat_skill_propose` / `fiat_memory_propose` / `fiat_role_facts_propose`：**仅评审 fork**，产出提案，不落盘
 
 ## 不要做的事
